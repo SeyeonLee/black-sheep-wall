@@ -152,6 +152,7 @@ Respond ONLY with a valid JSON object — no markdown, no preamble:
     setExtraction(null); setComparison(null); setError(null);
   };
 
+  // Gate: must have exactly one UAV selected
   if (!singleUAVSelected) {
     return (
       <div style={{
@@ -392,7 +393,7 @@ Respond ONLY with a valid JSON object — no markdown, no preamble:
               <span style={{ color: COLORS.ais }}>{nearAIS.name?.slice(0,14) || nearAIS.mmsi}</span>
               <span style={{ color: COLORS.textDim }}> · {nearAIS.type} · {nearAIS.flag}</span>
             </div>
-          : <div style={{ color: COLORS.textDim }}>// No real AIS contact in sensor range</div>
+          : <div style={{ color: COLORS.textDim }}>// No AIS contact in sensor range</div>
         }
         {nearDeployed && (
           <div>

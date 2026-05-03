@@ -95,9 +95,9 @@ export const CommandPanel = ({ state, dispatch, tool, setTool, deployType, setDe
           <><span style={{ color: COLORS.amber }}>{">"}</span> Click map to place {deployType.toLowerCase()}</>
         ) : (
           <>
-            <span style={{ color: COLORS.phosphor }}>{">"}</span> R-click water: move USV<br />
+            <span style={{ color: COLORS.phosphor }}>{">"}</span> R-click water: move/mission<br />
             <span style={{ color: COLORS.phosphor }}>{">"}</span> Click contact: TRACK<br />
-            <span style={{ color: COLORS.phosphor }}>{">"}</span> UAV alone → R-click: mission
+            <span style={{ color: COLORS.phosphor }}>{">"}</span> R-click friendly USV: track it
           </>
         )}
       </div>

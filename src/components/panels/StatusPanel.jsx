@@ -61,7 +61,7 @@ export const StatusPanel = ({ state, dispatch }) => {
                   {u.type === "UAV" && <Plane size={10} style={{ color: COLORS.phosphor, flexShrink: 0 }} />}
                   <span style={{ color: isSel ? COLORS.phosphor : COLORS.text }}>{u.label}</span>
                   <span style={{ fontSize: 9, color: COLORS.textDim, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                    {u.state.toUpperCase()}
+                    {u.state.toUpperCase().replace(/_/g, " ")}
                   </span>
                 </div>
                 <BatteryBar value={u.battery} />
@@ -77,7 +77,7 @@ export const StatusPanel = ({ state, dispatch }) => {
           <div style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 10, color: COLORS.text }}>
             <Row k="UNIT" v={usvSel.label} />
             <Row k="TYPE" v={usvSel.type} />
-            <Row k="STATE" v={usvSel.state.toUpperCase()}
+            <Row k="STATE" v={usvSel.state.toUpperCase().replace(/_/g, " ")}
                  vColor={
                    usvSel.state === "patrolling" ? COLORS.amber :
                    usvSel.state === "tracking" ? COLORS.amber :

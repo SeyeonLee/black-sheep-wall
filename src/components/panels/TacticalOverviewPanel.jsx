@@ -33,6 +33,11 @@ export const TacticalOverviewPanel = ({ state, cam, setCam }) => {
           <circle key={jz.id} cx={jz.x} cy={jz.y} r={jz.radius}
             fill={COLORS.hostile} fillOpacity="0.15" stroke={COLORS.hostile} strokeWidth="4" />
         ))}
+        {/* AIS ships (dots) */}
+        {state.aisShips.map((s) => (
+          <circle key={s.mmsi} cx={s.wx} cy={s.wy} r={14}
+            fill={COLORS.ais} fillOpacity="0.5" />
+        ))}
         {state.units.map((u) => {
           const det = state.detections[u.id];
           if (u.faction !== "friendly" && (!det || det.confidence < CONFIG.POSSIBLE_THRESHOLD)) return null;

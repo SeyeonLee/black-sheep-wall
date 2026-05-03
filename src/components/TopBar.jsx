@@ -14,6 +14,9 @@ export const TopBar = ({ state, dispatch, aisUsername, setAisUsername, aisStatus
                          aisStatus === "fetching" ? COLORS.amber :
                          aisStatus === "error" ? COLORS.hostile : COLORS.textDim;
 
+  // Count synthetic AIS ships (always-on simulated fleet)
+  const simShipCount = state.aisShips.length;
+
   return (
     <div style={{
       display: "flex", alignItems: "center", justifyContent: "space-between",
@@ -27,7 +30,7 @@ export const TopBar = ({ state, dispatch, aisUsername, setAisUsername, aisStatus
         <span style={{ fontWeight: 700, letterSpacing: "0.2em", fontSize: 14, fontFamily: "'Chakra Petch', monospace" }}>
           BLACK SHEEP WALL
         </span>
-        <span style={{ fontSize: 11, marginLeft: 8, color: COLORS.textDim }}>// ISR.CMD.v0.3</span>
+        <span style={{ fontSize: 11, marginLeft: 8, color: COLORS.textDim }}>// ISR.CMD.v0.4</span>
       </div>
 
       <div style={{ display: "flex", alignItems: "center", gap: 12, fontSize: 11, fontFamily: "'JetBrains Mono', monospace" }}>
@@ -36,14 +39,25 @@ export const TopBar = ({ state, dispatch, aisUsername, setAisUsername, aisStatus
           <span>T+{hh}:{mm}:{ss}</span>
         </div>
 
+        {/* Synthetic AIS fleet indicator */}
+        {simShipCount > 0 && (
+          <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+            <span style={{
+              width: 6, height: 6, borderRadius: "50%", background: COLORS.ais,
+              display: "inline-block", opacity: 0.9,
+              boxShadow: `0 0 4px ${COLORS.ais}`,
+            }} />
+            <span style={{ fontSize: 9, color: COLORS.ais }}>AIS.SIM</span>
+            <span style={{ fontSize: 9, color: COLORS.aisDim }}>({simShipCount})</span>
+          </div>
+        )}
+
+        {/* Real AIS (AISHub) */}
         <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
           {aisUsername
             ? <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
                 <span style={{ fontSize: 9, color: aisStatusColor }}>
-                  AIS {aisStatus.toUpperCase()}
-                </span>
-                <span style={{ fontSize: 9, color: COLORS.textDim }}>
-                  ({state.aisShips.length})
+                  AIS.LIVE {aisStatus.toUpperCase()}
                 </span>
                 <button onClick={onRefreshAIS}
                   style={{ fontSize: 9, padding: "0 4px", border: `1px solid ${COLORS.border}`,

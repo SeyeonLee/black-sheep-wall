@@ -32,10 +32,19 @@ export const UnitGlyph = ({ unit, selected, detected, onClick, onContextMenu, ca
       </g>
     );
   } else if (unit.type === "UAV") {
+    // Color: amber on mission, hostile+abort, normal otherwise
+    const onMission = unit.state === "flying_to_mission" || unit.state === "mission_orbit";
+    const aborting  = unit.missionAborted && unit.state === "returning";
+    const uavColor  = aborting ? COLORS.hostile : onMission ? COLORS.amber : color;
     const dim = unit.state === "docked" ? 0.4 : unit.state === "jammed" ? 0.6 : 1;
     glyph = (
       <g opacity={dim}>
-        <path d="M 0 -8 L 7 6 L 0 3 L -7 6 Z" fill={color} stroke={color} strokeWidth="1" />
+        <path d="M 0 -8 L 7 6 L 0 3 L -7 6 Z" fill={uavColor} stroke={uavColor} strokeWidth="1" />
+        {aborting && (
+          <text y="-14" textAnchor="middle" fontSize="11"
+                fontFamily="'JetBrains Mono', monospace"
+                fill={COLORS.hostile} fontWeight="700">!</text>
+        )}
       </g>
     );
   } else if (unit.type === "COMMERCIAL") {

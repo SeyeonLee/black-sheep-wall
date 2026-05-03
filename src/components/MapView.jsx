@@ -177,6 +177,11 @@ export const MapView = ({ state, dispatch, tool, setTool, deployType, setHover, 
 
   const onUnitContextMenu = (u, e) => {
     if (state.selectedIds.length === 0) return;
+    // ISR-to-ISR tracking: right-click on a friendly USV not in current selection
+    if (u.faction === "friendly" && u.type === "USV" && !state.selectedIds.includes(u.id)) {
+      dispatch({ type: "ENGAGE_TARGET", targetId: u.id });
+      return;
+    }
     if (u.faction === "friendly") return;
     const det = state.detections[u.id];
     if (!det || det.confidence < CONFIG.POSSIBLE_THRESHOLD) return;
@@ -246,6 +251,9 @@ export const MapView = ({ state, dispatch, tool, setTool, deployType, setHover, 
         <pattern id="patrol-hatch" width="8" height="8" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
           <line x1="0" y1="0" x2="0" y2="8" stroke={COLORS.phosphor} strokeWidth="0.6" opacity="0.4" />
         </pattern>
+        <pattern id="patrol-hatch-amber" width="8" height="8" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+          <line x1="0" y1="0" x2="0" y2="8" stroke={COLORS.amber} strokeWidth="0.6" opacity="0.35" />
+        </pattern>
       </defs>
 
       <rect x="0" y="0" width={CONFIG.WORLD_W} height={CONFIG.WORLD_H} fill="url(#ocean-grad)" />
@@ -256,24 +264,47 @@ export const MapView = ({ state, dispatch, tool, setTool, deployType, setHover, 
         <path key={i} d={d} fill={COLORS.land} stroke={COLORS.borderHi} strokeWidth="1" />
       ))}</g>
 
+      {/* Lat/Lon grid labels */}
       <g fontFamily="'JetBrains Mono', monospace" fontSize="10" fill={COLORS.textDim} opacity="0.5">
         {Array.from({ length: 8 }, (_, i) => (
-          <text key={`x${i}`} x={i * 500} y="20">{`E${(i * 5).toString().padStart(2, "0")}°`}</text>
+          <text key={`x${i}`} x={i * 500} y="20">{`E${(116 + i * 4).toString().padStart(3, "0")}°`}</text>
         ))}
-        {Array.from({ length: 5 }, (_, i) => (
-          <text key={`y${i}`} x="8" y={i * 500 + 10}>{`N${(40 - i * 2).toString().padStart(2, "0")}°`}</text>
+        {Array.from({ length: 6 }, (_, i) => (
+          <text key={`y${i}`} x="8" y={i * 500 + 10}>{`N${(42 - i * 6).toString().padStart(2, "0")}°`}</text>
         ))}
       </g>
 
+      {/* Patrol areas — Voronoi-aware: render each assignment's sub-region and path */}
       <g>{state.patrolAreas.map((pa) => {
         const c = polygonCentroid(pa.polygon);
+        // Support both old {path} format and new {assignments} format
+        const assignments = pa.assignments || [{ path: pa.path, region: pa.polygon }];
+        const colors = [COLORS.phosphor, COLORS.ais, COLORS.amber, COLORS.subsurface];
         return (
           <g key={pa.id}>
+            {/* Outer polygon boundary */}
             <polygon points={pa.polygon.map((p) => `${p.x},${p.y}`).join(" ")}
-              fill="url(#patrol-hatch)" stroke={COLORS.phosphor} strokeWidth="1.2"
-              strokeDasharray="6 3" opacity="0.85" />
-            <polyline points={pa.path.map((p) => `${p.x},${p.y}`).join(" ")}
-              fill="none" stroke={COLORS.phosphor} strokeWidth="1.2" strokeDasharray="3 4" opacity="0.7" />
+              fill="none" stroke={COLORS.phosphor} strokeWidth="1.2"
+              strokeDasharray="6 3" opacity="0.6" />
+            {/* Per-assignment sub-regions */}
+            {assignments.map((a, ai) => {
+              const col = colors[ai % colors.length];
+              const hasRegion = a.region && a.region !== pa.polygon && a.region.length >= 3;
+              return (
+                <g key={ai}>
+                  {hasRegion && (
+                    <polygon points={a.region.map((p) => `${p.x},${p.y}`).join(" ")}
+                      fill={`url(#patrol-hatch)`} stroke={col} strokeWidth="0.8"
+                      strokeDasharray="4 4" opacity="0.6" />
+                  )}
+                  {a.path && (
+                    <polyline points={a.path.map((p) => `${p.x},${p.y}`).join(" ")}
+                      fill="none" stroke={col} strokeWidth="1.2" strokeDasharray="3 4" opacity="0.7" />
+                  )}
+                </g>
+              );
+            })}
+            {/* Polygon vertices */}
             {pa.polygon.map((v, i) => (
               <circle key={i} cx={v.x} cy={v.y} r="2.5" fill={COLORS.phosphor} opacity="0.9" />
             ))}
@@ -291,6 +322,7 @@ export const MapView = ({ state, dispatch, tool, setTool, deployType, setHover, 
           onClick={(z, e) => { if (e.shiftKey) dispatch({ type: "REMOVE_JAM_ZONE", id: z.id }); }} />
       ))}</g>
 
+      {/* USV goal lines */}
       <g>{state.units.filter((u) => u.goal && u.faction === "friendly").map((u) => (
         <g key={`goal-${u.id}`}>
           <line x1={u.x} y1={u.y} x2={u.goal.x} y2={u.goal.y}
@@ -302,6 +334,30 @@ export const MapView = ({ state, dispatch, tool, setTool, deployType, setHover, 
         </g>
       ))}</g>
 
+      {/* UAV mission target lines */}
+      <g>{state.units
+        .filter((u) => u.type === "UAV" && u.missionTarget &&
+                       (u.state === "flying_to_mission" || u.state === "mission_orbit"))
+        .map((u) => (
+          <g key={`mission-${u.id}`}>
+            <line x1={u.x} y1={u.y} x2={u.missionTarget.x} y2={u.missionTarget.y}
+              stroke={COLORS.amber} strokeWidth="1" strokeDasharray="6 3" opacity="0.6">
+              <animate attributeName="stroke-dashoffset" from="0" to="-9" dur="1s" repeatCount="indefinite" />
+            </line>
+            <g transform={`translate(${u.missionTarget.x},${u.missionTarget.y})`}>
+              <circle r="16" fill="none" stroke={COLORS.amber} strokeWidth="1" opacity="0.5"
+                      strokeDasharray="4 4" />
+              <circle r="4" fill="none" stroke={COLORS.amber} strokeWidth="1.5" opacity="0.9" />
+              <text y="-22" textAnchor="middle" fontSize="7"
+                fontFamily="'JetBrains Mono', monospace"
+                fill={COLORS.amber} letterSpacing="0.15em">
+                {u.state === "mission_orbit" ? "▶ ON-STATION" : "▶ EN ROUTE"}
+              </text>
+            </g>
+          </g>
+        ))}</g>
+
+      {/* Engage / track target lines */}
       <g>{state.units
         .filter((u) => u.engageTargetId && u.faction === "friendly")
         .map((u) => {
@@ -344,6 +400,7 @@ export const MapView = ({ state, dispatch, tool, setTool, deployType, setHover, 
           fill="none" stroke={COLORS.subsurface} strokeWidth="0.6" strokeDasharray="1 3" />
       ))}</g>
 
+      {/* AIS ships */}
       <g>{state.aisShips.map((ship) => {
         const tracking = state.units.some(
           (u) => u.type === "USV" && u.aisEngageMMSI === ship.mmsi
@@ -354,6 +411,7 @@ export const MapView = ({ state, dispatch, tool, setTool, deployType, setHover, 
         );
       })}</g>
 
+      {/* Patrol drawing preview */}
       {tool === "patrol" && patrolPoints.length > 0 && hoverWorld && (
         <g>
           <polyline points={[...patrolPoints, hoverWorld].map((p) => `${p.x},${p.y}`).join(" ")}

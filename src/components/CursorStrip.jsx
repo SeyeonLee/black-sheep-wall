@@ -28,6 +28,9 @@ export const CursorStrip = ({ cursorWorld, state }) => {
         <span>FRIENDLY: <span style={{ color: COLORS.phosphor }}>{friendlyCount}</span></span>
         <span>HOSTILE: <span style={{ color: COLORS.hostile }}>{detectedHostile}</span></span>
         <span>SUB.SFC: <span style={{ color: COLORS.subsurface }}>{subsurfaceContacts}</span></span>
+        {state.aisShips.length > 0 && (
+          <span>AIS.SIM: <span style={{ color: COLORS.ais }}>{state.aisShips.length}</span></span>
+        )}
       </div>
       <div style={{ color: COLORS.phosphorDim }}>BLACK SHEEP WALL // PHASE 3</div>
     </div>

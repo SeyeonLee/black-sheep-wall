@@ -15,9 +15,15 @@ export const tickUnit = (u, units, jamZones, dt) => {
     const activeState = u.state === "orbiting" || u.state === "flying_to_mission" || u.state === "mission_orbit";
     if (inJam && activeState) {
       next.state = "jammed";
+      next.missionAborted = u.missionTarget != null; // flag abort if on a mission
       next.battery = Math.max(0, u.battery - CONFIG.UAV_BATTERY_DRAIN * dt);
       return next;
     }
+
+    // Proactive battery-margin check: abort mission if not enough to return home
+    const distToHome = Math.hypot(parent.x - u.x, parent.y - u.y);
+    const ticksToReturn = distToHome / CONFIG.UAV_SPEED;
+    const batteryToReturn = ticksToReturn * CONFIG.UAV_BATTERY_DRAIN + CONFIG.UAV_RETURN_BATTERY_MARGIN;
 
     if (u.state === "orbiting") {
       next.orbitAngle = u.orbitAngle + CONFIG.UAV_ORBIT_ANGULAR_SPEED * dt;
@@ -26,15 +32,24 @@ export const tickUnit = (u, units, jamZones, dt) => {
       next.heading = next.orbitAngle + Math.PI / 2;
       next.battery = Math.max(0, u.battery - CONFIG.UAV_BATTERY_DRAIN * dt);
       if (next.battery < CONFIG.UAV_LOW_BATTERY) next.state = "returning";
+
     } else if (u.state === "flying_to_mission") {
       const target = u.missionTarget;
       if (!target) { next.state = "returning"; return next; }
+
+      next.battery = Math.max(0, u.battery - CONFIG.UAV_BATTERY_DRAIN * dt);
+
+      // Abort proactively if battery won't cover return trip
+      if (u.battery <= batteryToReturn || next.battery < CONFIG.UAV_LOW_BATTERY) {
+        next.state = "returning";
+        next.missionAborted = true;
+        return next;
+      }
+
       const dx = target.x - u.x, dy = target.y - u.y;
       const d = Math.hypot(dx, dy);
-      next.battery = Math.max(0, u.battery - CONFIG.UAV_BATTERY_DRAIN * dt);
-      if (next.battery < CONFIG.UAV_LOW_BATTERY) { next.state = "returning"; return next; }
       if (d <= CONFIG.UAV_MISSION_ORBIT_RADIUS + 5) {
-        // Arrived — snap orbit angle to current relative bearing so no jump
+        // Arrived — snap orbit angle to current bearing to avoid position jump
         next.state = "mission_orbit";
         next.orbitAngle = Math.atan2(u.y - target.y, u.x - target.x);
       } else {
@@ -43,28 +58,41 @@ export const tickUnit = (u, units, jamZones, dt) => {
         next.y = u.y + v.y * CONFIG.UAV_SPEED * dt;
         next.heading = angleOf(dx, dy);
       }
+
     } else if (u.state === "mission_orbit") {
       const target = u.missionTarget;
       if (!target) { next.state = "returning"; return next; }
+
+      next.battery = Math.max(0, u.battery - CONFIG.UAV_BATTERY_DRAIN * dt);
+
+      // Abort proactively if battery won't cover return trip
+      if (u.battery <= batteryToReturn || next.battery < CONFIG.UAV_LOW_BATTERY) {
+        next.state = "returning";
+        next.missionAborted = true;
+        return next;
+      }
+
       next.orbitAngle = u.orbitAngle + CONFIG.UAV_ORBIT_ANGULAR_SPEED * dt;
       next.x = target.x + Math.cos(next.orbitAngle) * CONFIG.UAV_MISSION_ORBIT_RADIUS;
       next.y = target.y + Math.sin(next.orbitAngle) * CONFIG.UAV_MISSION_ORBIT_RADIUS;
       next.heading = next.orbitAngle + Math.PI / 2;
-      next.battery = Math.max(0, u.battery - CONFIG.UAV_BATTERY_DRAIN * dt);
-      if (next.battery < CONFIG.UAV_LOW_BATTERY) next.state = "returning";
+
     } else if (u.state === "jammed" || u.state === "returning") {
       const dx = parent.x - u.x, dy = parent.y - u.y;
       const d = Math.hypot(dx, dy);
       next.battery = Math.max(0, u.battery - CONFIG.UAV_BATTERY_DRAIN * dt);
       if (d < CONFIG.UAV_DOCK_RANGE) {
-        next.state = "docked"; next.x = parent.x; next.y = parent.y;
+        next.state = "docked";
+        next.x = parent.x; next.y = parent.y;
         next.missionTarget = null;
+        next.missionAborted = false;
       } else {
         const v = norm({ x: dx, y: dy });
         next.x = u.x + v.x * CONFIG.UAV_SPEED * dt;
         next.y = u.y + v.y * CONFIG.UAV_SPEED * dt;
         next.heading = angleOf(dx, dy);
       }
+
     } else if (u.state === "docked") {
       next.x = parent.x; next.y = parent.y;
       next.battery = Math.min(100, u.battery + CONFIG.UAV_CHARGE_RATE * dt);
@@ -169,7 +197,7 @@ export const applyUAVRotation = (units) =>
     const sibling = units.find(
       (x) => x.type === "UAV" && x.parentId === u.parentId && x.id !== u.id
     );
-    // Don't auto-launch if sibling is actively airborne on a mission or orbit
+    // Don't auto-launch if sibling is actively airborne
     const siblingActive = sibling && (
       sibling.state === "orbiting" ||
       sibling.state === "flying_to_mission" ||
@@ -193,8 +221,7 @@ export const updateDetections = (units, detections, dt) => {
         (f) => f.type === "USV" && f.state !== "charging" && dist(f, t) < CONFIG.SONAR_RANGE
       );
     } else {
-      const sensorRange = (f) =>
-        f.type === "UAV" ? CONFIG.UAV_SENSOR_RANGE : CONFIG.USV_SENSOR_RANGE;
+      const sensorRange = (f) => f.type === "UAV" ? CONFIG.UAV_SENSOR_RANGE : CONFIG.USV_SENSOR_RANGE;
       inRange = friendlies.some(
         (f) => f.state !== "docked" && f.state !== "charging" &&
                f.state !== "jammed" && dist(f, t) < sensorRange(f)
@@ -222,38 +249,25 @@ export const generateAlerts = (units, detections, prevAlerts, jamEvents, simTime
   units.forEach((u) => {
     const det = detections[u.id];
     if (!det) return;
-
     if (u.type === "MINE") {
-      if (det.confidence > CONFIG.POSSIBLE_THRESHOLD && !has(`mine-pos-${u.id}`)) {
+      if (det.confidence > CONFIG.POSSIBLE_THRESHOLD && !has(`mine-pos-${u.id}`))
         alerts.unshift({ id: newId("alt"), eventId: `mine-pos-${u.id}`,
-          kind: "MINE", severity: "med",
-          title: `POSSIBLE MINE — ${u.label}`,
-          body: "Sonar return suggests submerged threat.",
-          unitId: u.id, time: simTime });
-      }
-      if (det.confidence > CONFIG.CONFIRMED_THRESHOLD && !has(`mine-conf-${u.id}`)) {
+          kind: "MINE", severity: "med", title: `POSSIBLE MINE — ${u.label}`,
+          body: "Sonar return suggests submerged threat.", unitId: u.id, time: simTime });
+      if (det.confidence > CONFIG.CONFIRMED_THRESHOLD && !has(`mine-conf-${u.id}`))
         alerts.unshift({ id: newId("alt"), eventId: `mine-conf-${u.id}`,
-          kind: "MINE", severity: "high",
-          title: `CONFIRMED MINE — ${u.label}`,
-          body: "Submerged mine confirmed. Maintain standoff.",
-          unitId: u.id, time: simTime });
-      }
+          kind: "MINE", severity: "high", title: `CONFIRMED MINE — ${u.label}`,
+          body: "Submerged mine confirmed. Maintain standoff.", unitId: u.id, time: simTime });
     } else if (u.type === "SUBMARINE") {
-      if (det.confidence > CONFIG.CONFIRMED_THRESHOLD && !has(`sub-${u.id}`)) {
+      if (det.confidence > CONFIG.CONFIRMED_THRESHOLD && !has(`sub-${u.id}`))
         alerts.unshift({ id: newId("alt"), eventId: `sub-${u.id}`,
-          kind: "SUBSURFACE", severity: "high",
-          title: `SUBSURFACE CONTACT — ${u.label}`,
-          body: "Submerged hostile confirmed.",
-          unitId: u.id, time: simTime });
-      }
+          kind: "SUBSURFACE", severity: "high", title: `SUBSURFACE CONTACT — ${u.label}`,
+          body: "Submerged hostile confirmed.", unitId: u.id, time: simTime });
     } else if (u.faction === "hostile") {
-      if (det.confidence > CONFIG.CONFIRMED_THRESHOLD && !has(`hos-${u.id}`)) {
+      if (det.confidence > CONFIG.CONFIRMED_THRESHOLD && !has(`hos-${u.id}`))
         alerts.unshift({ id: newId("alt"), eventId: `hos-${u.id}`,
-          kind: "DETECT", severity: "high",
-          title: `HOSTILE CONFIRMED — ${u.label}`,
-          body: "Enemy vessel inside sensor envelope.",
-          unitId: u.id, time: simTime });
-      }
+          kind: "DETECT", severity: "high", title: `HOSTILE CONFIRMED — ${u.label}`,
+          body: "Enemy vessel inside sensor envelope.", unitId: u.id, time: simTime });
     }
   });
 
@@ -263,10 +277,23 @@ export const generateAlerts = (units, detections, prevAlerts, jamEvents, simTime
       alerts.unshift({ id: newId("alt"), eventId: `jam-${je.unitId}`,
         kind: "GPS.JAM", severity: isUSV ? "med" : "high",
         title: `GPS DENIAL — ${je.unitLabel}`,
-        body: isUSV
-          ? "USV in GPS-denied envelope. Backtracking to safe waters."
-          : "UAV in GPS-denied envelope. RTB to USV.",
+        body: isUSV ? "USV in GPS-denied envelope. Backtracking."
+                    : "UAV in GPS-denied envelope. RTB to USV.",
         unitId: je.unitId, time: simTime });
+    }
+  });
+
+  // Mission abort alerts
+  units.forEach((u) => {
+    if (u.type !== "UAV") return;
+    if (u.missionAborted && u.state === "returning" &&
+        !has(`uav-abort-${u.id}-${Math.floor(simTime / 10)}`)) {
+      alerts.unshift({ id: newId("alt"),
+        eventId: `uav-abort-${u.id}-${Math.floor(simTime / 10)}`,
+        kind: "MISSION.ABORT", severity: "med",
+        title: `UAV ${u.label} ABORTING MISSION`,
+        body: "Insufficient battery to complete mission. Returning to USV.",
+        unitId: u.id, time: simTime });
     }
   });
 
