@@ -5,6 +5,7 @@ import { CONFIG, COLORS } from "./config";
 import { worldToGeo, decodeAISType, geoToWorld } from "./utils";
 import { makeInitialState, generateAISFleet, pointAlongRoute } from "./sim/factories";
 import { reducer } from "./sim/reducer";
+import { loadLandData } from "./sim/landData";
 
 import { TopBar } from "./components/TopBar";
 import { MapView } from "./components/MapView";
@@ -20,19 +21,25 @@ export default function App() {
   const [state, dispatch] = useReducer(reducer, undefined, makeInitialState);
   const [tool, setTool] = useState("select");
   const [deployType, setDeployType] = useState("ENEMY");
+  const [mapStyle, setMapStyle] = useState("tactical");
+  const [fogEnabled, setFogEnabled] = useState(true);
   const [hover, setHover] = useState(null);
   const [cursorWorld, setCursorWorld] = useState(null);
-  // Camera centred on the ISR spawn at (2400, 1900) — middle of the First Island Chain
+  // Camera centred on ISR spawn at (3413, 2133) — 124°E, 22°N in the expanded Indo-Pacific world
+  // zoom=1.5 shows a wide regional view; clamp prevents seeing outside world bounds
   const [cam, setCam] = useState(() => {
-    const zoom = 0.9;
+    const zoom = 1.5;
     const vbW = CONFIG.WORLD_W / zoom;
     const vbH = CONFIG.WORLD_H / zoom;
-    return { x: 2400 - vbW / 2, y: 1900 - vbH / 2, zoom };
+    return { x: 3413 - vbW / 2, y: 2133 - vbH / 2, zoom };
   });
   const [aisUsername, setAisUsername] = useState("");
   const [aisStatus, setAisStatus] = useState("disconnected");
   const aisUsernameRef = useRef(aisUsername);
   aisUsernameRef.current = aisUsername;
+
+  // Load land data once on mount (for collision detection + tactical overlay)
+  useEffect(() => { loadLandData(); }, []);
 
   // Synthetic AIS fleet — always running, advances on every AIS_TICK_MS interval
   const fleetRef = useRef(null);
@@ -183,7 +190,9 @@ export default function App() {
     }}>
       <TopBar state={state} dispatch={dispatch}
               aisUsername={aisUsername} setAisUsername={setAisUsername}
-              aisStatus={aisStatus} onRefreshAIS={() => fetchAIS(aisUsername)} />
+              aisStatus={aisStatus} onRefreshAIS={() => fetchAIS(aisUsername)}
+              mapStyle={mapStyle} setMapStyle={setMapStyle}
+              fogEnabled={fogEnabled} setFogEnabled={setFogEnabled} />
 
       {/* Map area + alert feed side by side */}
       <div style={{ flex: "1 1 0", minHeight: 0, display: "flex", overflow: "hidden" }}>
@@ -191,7 +200,8 @@ export default function App() {
           <MapView state={state} dispatch={dispatch}
             tool={tool} setTool={setTool} deployType={deployType}
             setHover={setHover} setCursorWorld={setCursorWorld}
-            cam={cam} setCam={setCam} />
+            cam={cam} setCam={setCam}
+            mapStyle={mapStyle} fogEnabled={fogEnabled} />
         </div>
         <AlertFeed alerts={state.alerts} dispatch={dispatch} />
       </div>

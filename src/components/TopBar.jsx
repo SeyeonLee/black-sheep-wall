@@ -2,7 +2,7 @@ import { useState } from "react";
 import { Play, Pause, Hexagon, Power, Activity } from "lucide-react";
 import { COLORS } from "../config";
 
-export const TopBar = ({ state, dispatch, aisUsername, setAisUsername, aisStatus, onRefreshAIS }) => {
+export const TopBar = ({ state, dispatch, aisUsername, setAisUsername, aisStatus, onRefreshAIS, mapStyle, setMapStyle, fogEnabled, setFogEnabled }) => {
   const { paused, simSpeed, simTime } = state;
   const speeds = [1, 5, 20, 100];
   const hh = String(Math.floor(simTime / 3600)).padStart(2, "0");
@@ -110,6 +110,37 @@ export const TopBar = ({ state, dispatch, aisUsername, setAisUsername, aisStatus
               }}>{s}×</button>
           ))}
         </div>
+
+        {/* Map style toggle */}
+        <div style={{ display: "flex", border: `1px solid ${COLORS.border}`, marginLeft: 4 }}>
+          {[
+            { id: "tactical", label: "TACT" },
+            { id: "satellite", label: "SAT" },
+            { id: "nautical", label: "CHART" },
+          ].map(({ id, label }) => (
+            <button key={id} onClick={() => setMapStyle(id)}
+              style={{
+                padding: "4px 9px", fontFamily: "inherit", fontSize: 10,
+                background: mapStyle === id ? COLORS.ais : "transparent",
+                color: mapStyle === id ? COLORS.bg : COLORS.aisDim,
+                fontWeight: mapStyle === id ? 700 : 400,
+                border: "none", cursor: "pointer", letterSpacing: "0.08em",
+              }}>{label}</button>
+          ))}
+        </div>
+
+        {/* Fog of war toggle */}
+        <button onClick={() => setFogEnabled(!fogEnabled)}
+          title={fogEnabled ? "Disable fog of war" : "Enable fog of war"}
+          style={{
+            padding: "4px 9px", fontFamily: "inherit", fontSize: 10,
+            border: `1px solid ${fogEnabled ? COLORS.subsurface : COLORS.border}`,
+            background: fogEnabled ? "rgba(198,107,255,0.12)" : "transparent",
+            color: fogEnabled ? COLORS.subsurface : COLORS.textDim,
+            cursor: "pointer", letterSpacing: "0.08em", fontWeight: fogEnabled ? 700 : 400,
+          }}>
+          FOG {fogEnabled ? "ON" : "OFF"}
+        </button>
       </div>
 
       <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 11, color: COLORS.phosphorDim }}>

@@ -2,23 +2,76 @@ import { CONFIG } from "../config";
 import { tickUnit, applyUAVRotation, updateDetections, generateAlerts } from "./tick";
 import { polygonSweepPath, placeVoronoiSeeds, voronoiSubPolygons } from "./geometry";
 import { newId, createEnemyVessel, createCommercialVessel, createSubmarine, createMine, createISRUnit, createJamZone } from "./factories";
+import { isOnLand } from "./landData";
 
-export const clearOrdersForUSVs = (state, usvIds) => ({
-  units: state.units.map((u) =>
+// ─── Re-partition a patrol area for a (smaller) set of remaining unit IDs ──────
+const repartitionPatrol = (pa, remainingIds) => {
+  let assignments;
+  if (remainingIds.length === 1) {
+    const path = polygonSweepPath(pa.polygon);
+    assignments = [{ usvId: remainingIds[0], path, region: pa.polygon }];
+  } else {
+    const seeds = placeVoronoiSeeds(pa.polygon, remainingIds.length);
+    const regions = voronoiSubPolygons(pa.polygon, seeds);
+    assignments = remainingIds.map((uid, i) => ({
+      usvId: uid,
+      path: polygonSweepPath(regions[i]?.length >= 3 ? regions[i] : pa.polygon),
+      region: regions[i]?.length >= 3 ? regions[i] : pa.polygon,
+    }));
+  }
+  return { ...pa, unitIds: remainingIds, assignments };
+};
+
+// ─── Clear orders for specific USVs; remaining patrol-mates get re-partitioned ─
+export const clearOrdersForUSVs = (state, usvIds) => {
+  // Reset departing USVs to idle
+  let units = state.units.map((u) =>
     usvIds.includes(u.id)
       ? { ...u, goal: null, patrolPath: null, patrolIdx: 0,
           engageTargetId: null, aisEngageMMSI: null, state: "idle" }
       : u
-  ),
-  patrolAreas: state.patrolAreas.filter(
-    (pa) => !pa.unitIds.some((id) => usvIds.includes(id))
-  ),
-});
+  );
+
+  const patrolAreas = [];
+
+  for (const pa of state.patrolAreas) {
+    const leavingFromThis = pa.unitIds.filter((id) => usvIds.includes(id));
+    if (leavingFromThis.length === 0) {
+      // Not affected — keep as-is
+      patrolAreas.push(pa);
+      continue;
+    }
+    const remainingIds = pa.unitIds.filter((id) => !usvIds.includes(id));
+    if (remainingIds.length === 0) {
+      // All units leaving — discard patrol area
+      continue;
+    }
+    // Re-partition for the remaining units
+    const updated = repartitionPatrol(pa, remainingIds);
+    patrolAreas.push(updated);
+    // Give each remaining unit its new sub-region sweep
+    updated.assignments.forEach(({ usvId, path }) => {
+      units = units.map((u) =>
+        u.id === usvId
+          ? { ...u, patrolPath: path, patrolIdx: 0, state: "patrolling", goal: null }
+          : u
+      );
+    });
+  }
+
+  return { units, patrolAreas };
+};
 
 export const reducer = (state, action) => {
   switch (action.type) {
+
+    // ─────────────────────────────────────────────────────────────────────────
     case "TICK": {
       const dt = state.simSpeed;
+      let patrolAreas = state.patrolAreas;
+      const mineMarkers = [...state.mineMarkers];
+
+      // AIS-engage: keep USVs pointed at their live AIS ship
       const preUnits = state.units.map((u) => {
         if (u.type !== "USV" || !u.aisEngageMMSI) return u;
         const ship = state.aisShips.find((s) => s.mmsi === u.aisEngageMMSI);
@@ -29,9 +82,115 @@ export const reducer = (state, action) => {
         };
         return { ...u, goal: standoffPt, state: "tracking" };
       });
+
       let units = preUnits.map((u) => tickUnit(u, preUnits, state.jamZones, dt));
       units = applyUAVRotation(units);
       const detections = updateDetections(units, state.detections, dt);
+
+      // ── #1 Mine markers: stamp location on first POSSIBLE detection ─────────
+      units.filter((u) => u.type === "MINE").forEach((mine) => {
+        const prevConf = state.detections[mine.id]?.confidence ?? 0;
+        const newConf  = detections[mine.id]?.confidence ?? 0;
+        if (prevConf < CONFIG.POSSIBLE_THRESHOLD && newConf >= CONFIG.POSSIBLE_THRESHOLD) {
+          if (!mineMarkers.find((m) => m.mineId === mine.id)) {
+            mineMarkers.push({
+              id: newId("mkr"),
+              x: mine.x, y: mine.y,
+              label: mine.label,
+              mineId: mine.id,
+            });
+          }
+        }
+      });
+
+      // ── #2 Auto-track newly detected submarines (idle USVs) ─────────────────
+      const prevDetFn = (id) => state.detections[id]?.confidence ?? 0;
+      const curDetFn  = (id) => detections[id]?.confidence ?? 0;
+
+      const newSubContacts = units.filter((u) =>
+        u.type === "SUBMARINE" &&
+        prevDetFn(u.id) < CONFIG.POSSIBLE_THRESHOLD &&
+        curDetFn(u.id) >= CONFIG.POSSIBLE_THRESHOLD
+      );
+      if (newSubContacts.length > 0) {
+        newSubContacts.forEach((sub) => {
+          const idleUSVs = units.filter((u) =>
+            u.type === "USV" && u.faction === "friendly" &&
+            u.state === "idle" && !u.engageTargetId && !u.aisEngageMMSI
+          );
+          if (idleUSVs.length === 0) return;
+          const nearest = idleUSVs.reduce((a, b) =>
+            Math.hypot(a.x - sub.x, a.y - sub.y) <
+            Math.hypot(b.x - sub.x, b.y - sub.y) ? a : b
+          );
+          units = units.map((u) =>
+            u.id === nearest.id ? { ...u, engageTargetId: sub.id, state: "tracking" } : u
+          );
+        });
+      }
+
+      // ── #2 Auto-track newly detected hostile surface vessels (idle USVs) ────
+      const newHostileContacts = units.filter((u) =>
+        u.type === "ENEMY" && u.faction === "hostile" &&
+        prevDetFn(u.id) < CONFIG.POSSIBLE_THRESHOLD &&
+        curDetFn(u.id) >= CONFIG.POSSIBLE_THRESHOLD
+      );
+      if (newHostileContacts.length > 0) {
+        newHostileContacts.forEach((hostile) => {
+          const idleUSVs = units.filter((u) =>
+            u.type === "USV" && u.faction === "friendly" &&
+            u.state === "idle" && !u.engageTargetId && !u.aisEngageMMSI
+          );
+          if (idleUSVs.length === 0) return;
+          const nearest = idleUSVs.reduce((a, b) =>
+            Math.hypot(a.x - hostile.x, a.y - hostile.y) <
+            Math.hypot(b.x - hostile.x, b.y - hostile.y) ? a : b
+          );
+          units = units.map((u) =>
+            u.id === nearest.id ? { ...u, engageTargetId: hostile.id, state: "tracking" } : u
+          );
+        });
+      }
+
+      // ── #3/#4 Patrol interrupt: patrolling USV spots confirmed contact ───────
+      // Build map: usvId → nearest target the USV can sense
+      const patrolInterruptMap = {};
+      for (const u of units) {
+        if (u.type !== "USV" || u.faction !== "friendly") continue;
+        if (u.state !== "patrolling") continue;
+        if (u.engageTargetId) continue; // already tracking
+
+        let bestTarget = null;
+        let bestDist   = Infinity;
+        for (const t of units) {
+          if (t.type !== "ENEMY" && t.type !== "SUBMARINE") continue;
+          if (curDetFn(t.id) < CONFIG.POSSIBLE_THRESHOLD) continue;
+          const range = t.type === "SUBMARINE" ? CONFIG.SONAR_RANGE : CONFIG.USV_SENSOR_RANGE;
+          const d = Math.hypot(u.x - t.x, u.y - t.y);
+          if (d <= range && d < bestDist) {
+            bestTarget = t;
+            bestDist   = d;
+          }
+        }
+        if (bestTarget) patrolInterruptMap[u.id] = bestTarget.id;
+      }
+
+      if (Object.keys(patrolInterruptMap).length > 0) {
+        const interruptingIds = Object.keys(patrolInterruptMap);
+        // Remove interrupted USVs from their patrol areas and re-partition remainder (#4)
+        const cleared = clearOrdersForUSVs({ ...state, units, patrolAreas }, interruptingIds);
+        units       = cleared.units;
+        patrolAreas = cleared.patrolAreas;
+        // Assign each interrupted USV to its spotted target
+        interruptingIds.forEach((usvId) => {
+          units = units.map((u) =>
+            u.id === usvId
+              ? { ...u, engageTargetId: patrolInterruptMap[usvId], state: "tracking" }
+              : u
+          );
+        });
+      }
+
       const jamEvents = units
         .filter((u) => u.faction === "friendly" && u.state === "jammed")
         .map((u) => ({ unitId: u.id, unitLabel: u.label, unitType: u.type }));
@@ -40,21 +199,29 @@ export const reducer = (state, action) => {
       const newReveals = units
         .filter((u) => u.faction === "friendly" && u.state !== "docked" && u.state !== "jammed")
         .map((u) => ({ x: u.x, y: u.y, r: CONFIG.FOG_REVEAL_RANGE }));
-      return { ...state, units, detections, alerts, fogReveal: newReveals, simTime: newSimTime };
+
+      return {
+        ...state,
+        units, detections, alerts,
+        fogReveal: newReveals,
+        simTime: newSimTime,
+        patrolAreas,
+        mineMarkers,
+      };
     }
+
     case "TOGGLE_PAUSE": return { ...state, paused: !state.paused };
-    case "SET_SPEED": return { ...state, simSpeed: action.speed };
-    case "SELECT": return { ...state, selectedIds: action.ids };
+    case "SET_SPEED":    return { ...state, simSpeed: action.speed };
+    case "SELECT":       return { ...state, selectedIds: action.ids };
 
     case "MOVE_SELECTED": {
       const selectedFriendly = state.units.filter(
         (u) => state.selectedIds.includes(u.id) && u.faction === "friendly"
       );
-      const usvIds = selectedFriendly.filter((u) => u.type === "USV").map((u) => u.id);
+      const usvIds    = selectedFriendly.filter((u) => u.type === "USV").map((u) => u.id);
       const soloUavIds = selectedFriendly.filter((u) => u.type === "UAV").map((u) => u.id);
 
       if (usvIds.length > 0) {
-        // USVs in selection → USVs respond to move; UAVs keep their current orbit/mission
         const cleared = clearOrdersForUSVs(state, usvIds);
         const units = cleared.units.map((u) =>
           usvIds.includes(u.id) ? { ...u, goal: action.target, state: "moving" } : u
@@ -62,7 +229,6 @@ export const reducer = (state, action) => {
         return { ...state, units, patrolAreas: cleared.patrolAreas };
       }
       if (soloUavIds.length > 0) {
-        // UAV-only selection → UAVs fly to point and orbit it independently
         const units = state.units.map((u) =>
           soloUavIds.includes(u.id)
             ? { ...u, missionTarget: action.target, state: "flying_to_mission" }
@@ -74,7 +240,6 @@ export const reducer = (state, action) => {
     }
 
     case "RECALL_UAV": {
-      // Cancel independent mission; UAV returns to orbiting its home USV
       const units = state.units.map((u) => {
         if (!state.selectedIds.includes(u.id) || u.type !== "UAV") return u;
         if (u.state === "flying_to_mission" || u.state === "mission_orbit") {
@@ -122,12 +287,11 @@ export const reducer = (state, action) => {
         const path = polygonSweepPath(polygon);
         assignments = [{ usvId: usvIds[0], path, region: polygon }];
       } else {
-        // Voronoi partition — each USV gets its own sub-region sweep
-        const seeds = placeVoronoiSeeds(polygon, usvIds.length);
+        const seeds   = placeVoronoiSeeds(polygon, usvIds.length);
         const regions = voronoiSubPolygons(polygon, seeds);
         assignments = usvIds.map((uid, i) => ({
           usvId: uid,
-          path: polygonSweepPath(regions[i]?.length >= 3 ? regions[i] : polygon),
+          path:   polygonSweepPath(regions[i]?.length >= 3 ? regions[i] : polygon),
           region: regions[i]?.length >= 3 ? regions[i] : polygon,
         }));
       }
@@ -151,6 +315,7 @@ export const reducer = (state, action) => {
     case "SPAWN_SUBMARINE":
       return { ...state, units: [...state.units, createSubmarine(action.x, action.y)] };
     case "SPAWN_MINE":
+      if (isOnLand(action.x, action.y)) return state;
       return { ...state, units: [...state.units, createMine(action.x, action.y)] };
     case "SPAWN_ISR": {
       const n = state.isrCount + 1;
@@ -190,6 +355,10 @@ export const reducer = (state, action) => {
           title: action.title, body: action.body, time: state.simTime,
         }, ...state.alerts].slice(0, 30),
       };
+
+    // ── #1 Mine marker removal ─────────────────────────────────────────────────
+    case "REMOVE_MINE_MARKER":
+      return { ...state, mineMarkers: state.mineMarkers.filter((m) => m.id !== action.id) };
 
     default: return state;
   }

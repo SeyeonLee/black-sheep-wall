@@ -1,23 +1,34 @@
 import { COLORS, CONFIG } from "../../config";
 import { rad2deg, isUnderwater } from "../../utils";
 
-export const UnitGlyph = ({ unit, selected, detected, onClick, onContextMenu, canTrack }) => {
+export const UnitGlyph = ({
+  unit, selected, detected, onClick, onContextMenu, canTrack, isAutoTracked,
+}) => {
   const isFriendly = unit.faction === "friendly";
-  const isHostile = unit.faction === "hostile";
-  const submerged = isUnderwater(unit);
+  const isHostile  = unit.faction === "hostile";
+  const submerged  = isUnderwater(unit);
 
   const baseColor = isFriendly ? COLORS.phosphor :
-                    submerged ? COLORS.subsurface :
-                    isHostile ? COLORS.hostile : COLORS.neutral;
-  const dimColor = isFriendly ? COLORS.phosphorDim :
-                   submerged ? COLORS.subsurfaceDim :
-                   isHostile ? COLORS.hostileDim : COLORS.neutralDim;
+                    submerged  ? COLORS.subsurface :
+                    isHostile  ? COLORS.hostile : COLORS.neutral;
+  const dimColor  = isFriendly ? COLORS.phosphorDim :
+                    submerged  ? COLORS.subsurfaceDim :
+                    isHostile  ? COLORS.hostileDim : COLORS.neutralDim;
 
-  if (!isFriendly && (!detected || detected.confidence < CONFIG.POSSIBLE_THRESHOLD)) return null;
+  const confidence   = detected?.confidence ?? (isFriendly ? 100 : 0);
 
-  const confidence = detected?.confidence ?? 100;
-  const isPossible = !isFriendly && confidence < CONFIG.CONFIRMED_THRESHOLD;
-  const color = isPossible ? dimColor : baseColor;
+  // Show enemy contacts once any detection has occurred (CONTACT_THRESHOLD)
+  if (!isFriendly && confidence < CONFIG.CONTACT_THRESHOLD) return null;
+
+  const isNewContact = !isFriendly && confidence < CONFIG.POSSIBLE_THRESHOLD;
+  const isPossible   = !isFriendly && confidence >= CONFIG.POSSIBLE_THRESHOLD && confidence < CONFIG.CONFIRMED_THRESHOLD;
+  // isConfirmed = isFriendly OR confidence >= CONFIRMED_THRESHOLD
+
+  // Priority: auto-tracked → amber; new contact → amber-dim; possible → dim; confirmed → base
+  const color = isAutoTracked   ? COLORS.amber
+              : isNewContact    ? COLORS.amberDim
+              : isPossible      ? dimColor
+              : baseColor;
 
   const headingDeg = rad2deg(unit.heading || 0);
   let glyph;
@@ -32,7 +43,6 @@ export const UnitGlyph = ({ unit, selected, detected, onClick, onContextMenu, ca
       </g>
     );
   } else if (unit.type === "UAV") {
-    // Color: amber on mission, hostile+abort, normal otherwise
     const onMission = unit.state === "flying_to_mission" || unit.state === "mission_orbit";
     const aborting  = unit.missionAborted && unit.state === "returning";
     const uavColor  = aborting ? COLORS.hostile : onMission ? COLORS.amber : color;
@@ -96,39 +106,68 @@ export const UnitGlyph = ({ unit, selected, detected, onClick, onContextMenu, ca
            onContextMenu(unit, e);
          }
        }}>
-      {/* Enlarged transparent hit area for non-friendly contacts */}
+      {/* Hit area */}
       {!isFriendly && <circle r="22" fill="transparent" />}
+
+      {/* ── Auto-tracked: pulsing amber ring ─────────────────────────────── */}
+      {isAutoTracked && (
+        <circle r="22" fill="none" stroke={COLORS.amber} strokeWidth="2" opacity="0.85">
+          <animate attributeName="r" values="18;28;18" dur="1.4s" repeatCount="indefinite" />
+          <animate attributeName="opacity" values="0.85;0.25;0.85" dur="1.4s" repeatCount="indefinite" />
+        </circle>
+      )}
+
+      {/* ── New contact (confidence < POSSIBLE): faint amber pulse ───────── */}
+      {isNewContact && !isAutoTracked && (
+        <circle r="16" fill="none" stroke={COLORS.amberDim} strokeWidth="1"
+                strokeDasharray="3 5" opacity="0.6">
+          <animate attributeName="opacity" values="0.6;0.1;0.6" dur="2.4s" repeatCount="indefinite" />
+        </circle>
+      )}
+
+      {/* ── Selected ring ─────────────────────────────────────────────────── */}
       {selected && (
         <g>
           <circle r="22" fill="none" stroke={baseColor} strokeWidth="1" strokeDasharray="3 3" opacity="0.9">
-            <animateTransform attributeName="transform" type="rotate" from="0" to="360" dur="6s" repeatCount="indefinite" />
+            <animateTransform attributeName="transform" type="rotate"
+              from="0" to="360" dur="6s" repeatCount="indefinite" />
           </circle>
           <circle r="26" fill="none" stroke={baseColor} strokeWidth="0.5" opacity="0.4" />
         </g>
       )}
-      {isPossible && (
+
+      {/* ── Possible contact dashed ring ──────────────────────────────────── */}
+      {isPossible && !isAutoTracked && (
         <circle r="18" fill="none" stroke={dimColor} strokeWidth="1" strokeDasharray="2 4" opacity="0.7" />
       )}
 
-      <g transform={rotateGlyph ? `rotate(${headingDeg + 90})` : ""} opacity={isPossible ? 0.75 : 1}>
+      <g transform={rotateGlyph ? `rotate(${headingDeg + 90})` : ""}
+         opacity={isNewContact ? 0.55 : isPossible ? 0.75 : 1}>
         {glyph}
       </g>
 
+      {/* ── Labels ───────────────────────────────────────────────────────── */}
       <text x="14" y="-10" fontSize="9" fontFamily="'JetBrains Mono', monospace"
             fill={selected ? baseColor : color}
-            opacity={isFriendly || !isPossible ? 1 : 0.8}>
-        {unit.label}{isPossible ? "?" : ""}
+            opacity={isFriendly || !isNewContact ? 1 : 0.7}>
+        {unit.label}{isNewContact ? "?" : isPossible ? "?" : ""}
       </text>
 
       {!isFriendly && (
         <text x="14" y="0" fontSize="6.5" fontFamily="'JetBrains Mono', monospace"
-              fill={isPossible ? COLORS.amber : color}
+              fill={isAutoTracked ? COLORS.amber
+                    : isNewContact ? COLORS.amberDim
+                    : isPossible   ? COLORS.amber
+                    : color}
               letterSpacing="0.1em">
-          {isPossible ? "POSSIBLE" : "CONFIRMED"}
+          {isAutoTracked ? "AUTO-TRK"
+           : isNewContact ? "NEW CNTCT"
+           : isPossible   ? "POSSIBLE"
+           : "CONFIRMED"}
         </text>
       )}
 
-      {unit.type === "COMMERCIAL" && !isPossible && (
+      {unit.type === "COMMERCIAL" && !isPossible && !isNewContact && (
         <g>
           <text x="14" y="9" fontSize="6.5" fontFamily="'JetBrains Mono', monospace"
                 fill={COLORS.textDim} letterSpacing="0.05em">
@@ -141,9 +180,9 @@ export const UnitGlyph = ({ unit, selected, detected, onClick, onContextMenu, ca
         </g>
       )}
 
-      {submerged && !isPossible && (
+      {submerged && !isPossible && !isNewContact && (
         <text x="-30" y="3" fontSize="6" fontFamily="'JetBrains Mono', monospace"
-              fill={COLORS.subsurfaceDim}>
+              fill={isAutoTracked ? COLORS.amberDim : COLORS.subsurfaceDim}>
           ~{Math.floor(20 + Math.abs(unit.x * 13 + unit.y * 7) % 60)}m
         </text>
       )}

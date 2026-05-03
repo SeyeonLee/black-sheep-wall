@@ -1,6 +1,5 @@
 // ─── CONFIG ───────────────────────────────────────────────────────────────────
-// Merged: hungry-einstein file structure + black-sheep-wall features
-// Map: First Island Chain / Indo-Pacific (116°E–148°E, 5°N–42°N)
+// Map: Indo-Pacific / global view (60°E–180°E, 20°S–70°N)
 export const CONFIG = {
   WORLD_W: 6400, WORLD_H: 4000,
 
@@ -20,7 +19,9 @@ export const CONFIG = {
   FOG_REVEAL_RANGE: 260,
 
   CONFIDENCE_RATE: 0.9, CONFIDENCE_DECAY: 0.15,
-  POSSIBLE_THRESHOLD: 35, CONFIRMED_THRESHOLD: 75,
+  CONTACT_THRESHOLD: 5,    // first render/alert threshold
+  POSSIBLE_THRESHOLD: 35,
+  CONFIRMED_THRESHOLD: 75,
   MINE_DETECTION_BOOST: 1.4,
 
   TICK_MS: 50,
@@ -30,9 +31,9 @@ export const CONFIG = {
   PATROL_LANES: 6,
   TRACK_STANDOFF: 90,
 
-  // First Island Chain geo bounds: 116°E–148°E, 5°N–42°N
-  GEO_LON_MIN: 116, GEO_LON_MAX: 148,
-  GEO_LAT_MIN:   5, GEO_LAT_MAX:  42,
+  // Extended Indo-Pacific geo bounds: 60°E–180°E, 20°S–70°N
+  GEO_LON_MIN:  60, GEO_LON_MAX: 180,
+  GEO_LAT_MIN: -20, GEO_LAT_MAX:  70,
 
   // Synthetic AIS fleet
   AIS_TICK_MS: 1000,

@@ -2,12 +2,139 @@ import { useState, useEffect, useRef, useCallback } from "react";
 import { CONFIG, COLORS } from "../config";
 import { clamp } from "../utils";
 import { polygonCentroid } from "../sim/geometry";
-import { LAND } from "../sim/factories";
+import { getLandPolygons } from "../sim/landData";
 import { UnitGlyph } from "./glyphs/UnitGlyph";
 import { JamZoneGlyph } from "./glyphs/JamZoneGlyph";
 import { AISShipGlyph } from "./glyphs/AISShipGlyph";
 
-export const MapView = ({ state, dispatch, tool, setTool, deployType, setHover, setCursorWorld, cam, setCam }) => {
+// ─── Tile math ─────────────────────────────────────────────────────────────────
+const lonToTileX = (lon, z) =>
+  Math.floor((lon + 180) / 360 * Math.pow(2, z));
+
+const latToTileY = (lat, z) => {
+  const r = lat * Math.PI / 180;
+  return Math.floor(
+    (1 - Math.log(Math.tan(r) + 1 / Math.cos(r)) / Math.PI) / 2 * Math.pow(2, z)
+  );
+};
+
+const tileToLon = (tx, z) => tx / Math.pow(2, z) * 360 - 180;
+
+const tileToLat = (ty, z) => {
+  const n = Math.PI - (2 * Math.PI * ty) / Math.pow(2, z);
+  return (180 / Math.PI) * Math.atan(0.5 * (Math.exp(n) - Math.exp(-n)));
+};
+
+// Linear projection helpers — matches geoToWorld in utils.js
+const lonToWorld = (lon) =>
+  (lon - CONFIG.GEO_LON_MIN) / (CONFIG.GEO_LON_MAX - CONFIG.GEO_LON_MIN) * CONFIG.WORLD_W;
+const latToWorld = (lat) =>
+  (CONFIG.GEO_LAT_MAX - lat) / (CONFIG.GEO_LAT_MAX - CONFIG.GEO_LAT_MIN) * CONFIG.WORLD_H;
+
+// ─── Tile URL templates ─────────────────────────────────────────────────────────
+const TILE_URL = {
+  satellite: (z, x, y) =>
+    `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${z}/${y}/${x}`,
+  nautical: (z, x, y) =>
+    `https://a.basemaps.cartocdn.com/rastertiles/voyager/${z}/${x}/${y}.png`,
+  seamark: (z, x, y) =>
+    `https://tiles.openseamap.org/seamark/${z}/${x}/${y}.png`,
+};
+
+// ─── TileLayer ──────────────────────────────────────────────────────────────────
+// Geo range is 120° lon × 90° lat → adjust tile zoom relative to cam.zoom.
+const TileLayer = ({ cam, style }) => {
+  const z = cam.zoom <= 0.18 ? 2
+          : cam.zoom <= 0.35 ? 3
+          : cam.zoom <= 0.7  ? 4
+          : cam.zoom <= 1.4  ? 5
+          : cam.zoom <= 2.8  ? 6
+          : cam.zoom <= 5.5  ? 7
+          : 8;
+  const n = Math.pow(2, z);
+
+  const vbW = CONFIG.WORLD_W / cam.zoom;
+  const vbH = CONFIG.WORLD_H / cam.zoom;
+
+  // Convert viewport world bounds → lon/lat
+  const lonRange = CONFIG.GEO_LON_MAX - CONFIG.GEO_LON_MIN;
+  const latRange = CONFIG.GEO_LAT_MAX - CONFIG.GEO_LAT_MIN;
+  const lonMin = CONFIG.GEO_LON_MIN + (cam.x / CONFIG.WORLD_W) * lonRange;
+  const lonMax = CONFIG.GEO_LON_MIN + ((cam.x + vbW) / CONFIG.WORLD_W) * lonRange;
+  const latMax = CONFIG.GEO_LAT_MAX - (cam.y / CONFIG.WORLD_H) * latRange;
+  const latMin = CONFIG.GEO_LAT_MAX - ((cam.y + vbH) / CONFIG.WORLD_H) * latRange;
+
+  const txMin = Math.max(0, lonToTileX(lonMin - 3, z));
+  const txMax = Math.min(n - 1, lonToTileX(lonMax + 3, z));
+  const tyMin = Math.max(0, latToTileY(Math.min(85, latMax + 4), z));
+  const tyMax = Math.min(n - 1, latToTileY(Math.max(-85, latMin - 4), z));
+
+  const tiles = [];
+  for (let ty = tyMin; ty <= tyMax; ty++) {
+    for (let tx = txMin; tx <= txMax; tx++) {
+      const lon0 = tileToLon(tx, z);
+      const lon1 = tileToLon(tx + 1, z);
+      const lat0 = tileToLat(ty, z);       // north edge
+      const lat1 = tileToLat(ty + 1, z);   // south edge
+
+      const wx0 = lonToWorld(lon0);
+      const wx1 = lonToWorld(lon1);
+      const wy0 = latToWorld(lat0);         // smaller y = further north
+      const wy1 = latToWorld(lat1);
+
+      const url = TILE_URL[style]?.(z, tx, ty);
+      if (!url) continue;
+      tiles.push({ key: `${z}-${tx}-${ty}`, url, x: wx0, y: wy0, w: wx1 - wx0, h: wy1 - wy0 });
+    }
+  }
+
+  return (
+    <g>
+      {tiles.map(({ key, url, x, y, w, h }) => (
+        <image key={key} href={url}
+          x={x} y={y} width={w} height={h}
+          preserveAspectRatio="none" />
+      ))}
+    </g>
+  );
+};
+
+// ─── LandLayer (tactical mode — real GeoJSON polygons) ─────────────────────────
+const LandLayer = () => {
+  const polys = getLandPolygons();
+  return (
+    <g>
+      {polys.map(({ points }, i) => (
+        <polygon key={i}
+          points={points.map((p) => `${p.x},${p.y}`).join(" ")}
+          fill={COLORS.land} stroke={COLORS.borderHi} strokeWidth="1" />
+      ))}
+    </g>
+  );
+};
+
+// ─── Camera bounds clamp ────────────────────────────────────────────────────────
+// Prevents the viewport from showing empty space outside the world rectangle.
+const clampCamBounds = (c) => {
+  const vbW = CONFIG.WORLD_W / c.zoom;
+  const vbH = CONFIG.WORLD_H / c.zoom;
+  // If viewport larger than world, center it; otherwise clamp to edges.
+  const x = vbW >= CONFIG.WORLD_W
+    ? (CONFIG.WORLD_W - vbW) / 2
+    : clamp(c.x, 0, CONFIG.WORLD_W - vbW);
+  const y = vbH >= CONFIG.WORLD_H
+    ? (CONFIG.WORLD_H - vbH) / 2
+    : clamp(c.y, 0, CONFIG.WORLD_H - vbH);
+  return { ...c, x, y };
+};
+
+// ─── MapView ───────────────────────────────────────────────────────────────────
+export const MapView = ({
+  state, dispatch, tool, setTool, deployType,
+  setHover, setCursorWorld, cam, setCam,
+  mapStyle = "tactical",
+  fogEnabled = true,
+}) => {
   const svgRef = useRef(null);
   const cursorScreenRef = useRef(null);
   const camRef = useRef(cam);
@@ -18,6 +145,8 @@ export const MapView = ({ state, dispatch, tool, setTool, deployType, setHover, 
   const [panStart, setPanStart] = useState(null);
   const [patrolPoints, setPatrolPoints] = useState([]);
   const [hoverWorld, setHoverWorld] = useState(null);
+
+  const isTile = mapStyle === "satellite" || mapStyle === "nautical";
 
   const screenToWorld = useCallback((sx, sy) => {
     const svg = svgRef.current;
@@ -30,6 +159,7 @@ export const MapView = ({ state, dispatch, tool, setTool, deployType, setHover, 
     return { x: wp.x, y: wp.y };
   }, []);
 
+  // ── Edge-pan RAF ──────────────────────────────────────────────────────────────
   useEffect(() => {
     let raf;
     const tick = () => {
@@ -39,7 +169,7 @@ export const MapView = ({ state, dispatch, tool, setTool, deployType, setHover, 
         const rect = svg.getBoundingClientRect();
         const z = CONFIG.EDGE_PAN_ZONE;
         const lx = cs.x - rect.left, rx = rect.right - cs.x;
-        const ty = cs.y - rect.top, by = rect.bottom - cs.y;
+        const ty = cs.y - rect.top,  by = rect.bottom - cs.y;
         let fx = 0, fy = 0;
         if (lx < z && lx >= -2) fx = -((z - Math.max(0, lx)) / z);
         else if (rx < z && rx >= -2) fx = ((z - Math.max(0, rx)) / z);
@@ -49,7 +179,7 @@ export const MapView = ({ state, dispatch, tool, setTool, deployType, setHover, 
           const c = camRef.current;
           const dx = (fx * CONFIG.EDGE_PAN_SPEED) / c.zoom;
           const dy = (fy * CONFIG.EDGE_PAN_SPEED) / c.zoom;
-          setCam((cur) => ({ ...cur, x: cur.x + dx, y: cur.y + dy }));
+          setCam((cur) => clampCamBounds({ ...cur, x: cur.x + dx, y: cur.y + dy }));
           const wp = screenToWorld(cs.x, cs.y);
           setHoverWorld(wp); setHover(wp); setCursorWorld(wp);
           if (dragBoxRef.current) {
@@ -97,7 +227,7 @@ export const MapView = ({ state, dispatch, tool, setTool, deployType, setHover, 
       const vbW = CONFIG.WORLD_W / cam.zoom, vbH = CONFIG.WORLD_H / cam.zoom;
       const dx = ((e.clientX - panStart.sx) / rect.width) * vbW;
       const dy = ((e.clientY - panStart.sy) / rect.height) * vbH;
-      setCam({ ...cam, x: panStart.camX - dx, y: panStart.camY - dy });
+      setCam(clampCamBounds({ ...cam, x: panStart.camX - dx, y: panStart.camY - dy }));
     }
     if (dragBox) setDragBox((db) => db && { ...db, x1: wp.x, y1: wp.y });
   };
@@ -140,13 +270,13 @@ export const MapView = ({ state, dispatch, tool, setTool, deployType, setHover, 
     e.preventDefault();
     const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
     const wp = screenToWorld(e.clientX, e.clientY);
-    const newZoom = clamp(cam.zoom * factor, 0.3, 3);
+    const newZoom = clamp(cam.zoom * factor, 0.12, 12);
     const newVbW = CONFIG.WORLD_W / newZoom, newVbH = CONFIG.WORLD_H / newZoom;
     const svg = svgRef.current;
     const rect = svg.getBoundingClientRect();
     const px = (e.clientX - rect.left) / rect.width;
     const py = (e.clientY - rect.top) / rect.height;
-    setCam({ x: wp.x - px * newVbW, y: wp.y - py * newVbH, zoom: newZoom });
+    setCam(clampCamBounds({ x: wp.x - px * newVbW, y: wp.y - py * newVbH, zoom: newZoom }));
   };
 
   const hasUSVSelected = state.units.some(
@@ -155,7 +285,6 @@ export const MapView = ({ state, dispatch, tool, setTool, deployType, setHover, 
 
   const onClickUnit = (u, e) => {
     if (u.faction !== "friendly") {
-      // Left-click on a detected contact when USVs are selected → instant track
       if (hasUSVSelected) {
         const det = state.detections[u.id];
         if (det && det.confidence >= CONFIG.POSSIBLE_THRESHOLD) {
@@ -177,7 +306,6 @@ export const MapView = ({ state, dispatch, tool, setTool, deployType, setHover, 
 
   const onUnitContextMenu = (u, e) => {
     if (state.selectedIds.length === 0) return;
-    // ISR-to-ISR tracking: right-click on a friendly USV not in current selection
     if (u.faction === "friendly" && u.type === "USV" && !state.selectedIds.includes(u.id)) {
       dispatch({ type: "ENGAGE_TARGET", targetId: u.id });
       return;
@@ -188,7 +316,7 @@ export const MapView = ({ state, dispatch, tool, setTool, deployType, setHover, 
     dispatch({ type: "ENGAGE_TARGET", targetId: u.id });
   };
 
-  const onAISContextMenu = (ship, e) => {
+  const onAISContextMenu = (ship) => {
     if (state.selectedIds.length === 0) return;
     dispatch({ type: "ENGAGE_AIS_TARGET", mmsi: ship.mmsi });
   };
@@ -201,13 +329,23 @@ export const MapView = ({ state, dispatch, tool, setTool, deployType, setHover, 
       sonar: u.type === "USV" ? CONFIG.SONAR_RANGE : 0,
     }));
 
+  // Units currently being tracked by a friendly USV (for amber auto-track highlight)
+  const trackedIds = new Set(
+    state.units
+      .filter((u) => u.faction === "friendly" && u.engageTargetId)
+      .map((u) => u.engageTargetId)
+  );
+
   const vbW = CONFIG.WORLD_W / cam.zoom;
   const vbH = CONFIG.WORLD_H / cam.zoom;
+
+  const fogFill = isTile ? "rgba(0,0,0,0.68)" : "rgba(2,8,5,0.22)";
 
   return (
     <svg ref={svgRef}
       style={{
-        background: COLORS.ocean1, userSelect: "none",
+        background: isTile ? "#0a1520" : COLORS.ocean1,
+        userSelect: "none",
         display: "block", width: "100%", height: "100%",
         cursor: tool === "patrol" ? "crosshair" : tool === "deploy" ? "copy" : "default",
       }}
@@ -229,7 +367,7 @@ export const MapView = ({ state, dispatch, tool, setTool, deployType, setHover, 
           <path d="M 500 0 L 0 0 0 500" fill="none" stroke={COLORS.borderHi} strokeWidth="0.8" />
         </pattern>
         <mask id="fog-mask">
-          <rect x="0" y="0" width={CONFIG.WORLD_W} height={CONFIG.WORLD_H} fill="white" />
+          <rect x={cam.x} y={cam.y} width={vbW} height={vbH} fill="white" />
           {state.fogReveal.map((r, i) => (
             <radialGradient key={i} id={`reveal-${i}`}>
               <stop offset="0%" stopColor="black" />
@@ -251,42 +389,69 @@ export const MapView = ({ state, dispatch, tool, setTool, deployType, setHover, 
         <pattern id="patrol-hatch" width="8" height="8" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
           <line x1="0" y1="0" x2="0" y2="8" stroke={COLORS.phosphor} strokeWidth="0.6" opacity="0.4" />
         </pattern>
-        <pattern id="patrol-hatch-amber" width="8" height="8" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
-          <line x1="0" y1="0" x2="0" y2="8" stroke={COLORS.amber} strokeWidth="0.6" opacity="0.35" />
-        </pattern>
       </defs>
 
-      <rect x="0" y="0" width={CONFIG.WORLD_W} height={CONFIG.WORLD_H} fill="url(#ocean-grad)" />
-      <rect x="0" y="0" width={CONFIG.WORLD_W} height={CONFIG.WORLD_H} fill="url(#grid)" />
-      <rect x="0" y="0" width={CONFIG.WORLD_W} height={CONFIG.WORLD_H} fill="url(#grid-major)" />
+      {/* ── Background layer ───────────────────────────────────────────────── */}
+      {mapStyle === "tactical" && (
+        <>
+          {/* Ocean background extends to full viewBox (covers beyond world bounds too) */}
+          <rect x={cam.x} y={cam.y} width={vbW} height={vbH} fill="url(#ocean-grad)" />
+          <rect x={cam.x} y={cam.y} width={vbW} height={vbH} fill="url(#grid)" />
+          <rect x={cam.x} y={cam.y} width={vbW} height={vbH} fill="url(#grid-major)" />
+          <LandLayer />
+        </>
+      )}
+      {mapStyle === "satellite" && (
+        <>
+          <TileLayer cam={cam} style="satellite" />
+          <rect x={cam.x} y={cam.y} width={vbW} height={vbH} fill="url(#grid)" opacity="0.07" />
+        </>
+      )}
+      {mapStyle === "nautical" && (
+        <>
+          <TileLayer cam={cam} style="nautical" />
+          <TileLayer cam={cam} style="seamark" />
+          <rect x={cam.x} y={cam.y} width={vbW} height={vbH} fill="url(#grid)" opacity="0.10" />
+        </>
+      )}
 
-      <g>{LAND.map((d, i) => (
-        <path key={i} d={d} fill={COLORS.land} stroke={COLORS.borderHi} strokeWidth="1" />
-      ))}</g>
+      {/* ── Lat/Lon labels (tactical only, global grid) ────────────────────── */}
+      {mapStyle === "tactical" && (
+        <g fontFamily="'JetBrains Mono', monospace" fontSize="10" fill={COLORS.textDim} opacity="0.5">
+          {/* Every 15° longitude */}
+          {Array.from({ length: 17 }, (_, i) => {
+            const lon = CONFIG.GEO_LON_MIN + i * (CONFIG.GEO_LON_MAX - CONFIG.GEO_LON_MIN) / 8;
+            const step = Math.round((CONFIG.GEO_LON_MAX - CONFIG.GEO_LON_MIN) / 8);
+            const actualLon = CONFIG.GEO_LON_MIN + i * step;
+            if (actualLon > CONFIG.GEO_LON_MAX) return null;
+            const x = lonToWorld(actualLon);
+            const label = actualLon >= 0
+              ? `E${String(actualLon).padStart(3, "0")}°`
+              : `W${String(-actualLon).padStart(3, "0")}°`;
+            return <text key={`lon${i}`} x={x} y={cam.y + 16}>{label}</text>;
+          })}
+          {/* Every ~10° latitude */}
+          {Array.from({ length: 10 }, (_, i) => {
+            const step = Math.round((CONFIG.GEO_LAT_MAX - CONFIG.GEO_LAT_MIN) / 9);
+            const lat = CONFIG.GEO_LAT_MAX - i * step;
+            if (lat < CONFIG.GEO_LAT_MIN) return null;
+            const y = latToWorld(lat);
+            const label = lat >= 0 ? `N${String(lat).padStart(2, "0")}°` : `S${String(-lat).padStart(2, "0")}°`;
+            return <text key={`lat${i}`} x={cam.x + 6} y={y + 4}>{label}</text>;
+          })}
+        </g>
+      )}
 
-      {/* Lat/Lon grid labels */}
-      <g fontFamily="'JetBrains Mono', monospace" fontSize="10" fill={COLORS.textDim} opacity="0.5">
-        {Array.from({ length: 8 }, (_, i) => (
-          <text key={`x${i}`} x={i * 500} y="20">{`E${(116 + i * 4).toString().padStart(3, "0")}°`}</text>
-        ))}
-        {Array.from({ length: 6 }, (_, i) => (
-          <text key={`y${i}`} x="8" y={i * 500 + 10}>{`N${(42 - i * 6).toString().padStart(2, "0")}°`}</text>
-        ))}
-      </g>
-
-      {/* Patrol areas — Voronoi-aware: render each assignment's sub-region and path */}
+      {/* ── Patrol areas ───────────────────────────────────────────────────── */}
       <g>{state.patrolAreas.map((pa) => {
         const c = polygonCentroid(pa.polygon);
-        // Support both old {path} format and new {assignments} format
         const assignments = pa.assignments || [{ path: pa.path, region: pa.polygon }];
         const colors = [COLORS.phosphor, COLORS.ais, COLORS.amber, COLORS.subsurface];
         return (
           <g key={pa.id}>
-            {/* Outer polygon boundary */}
             <polygon points={pa.polygon.map((p) => `${p.x},${p.y}`).join(" ")}
               fill="none" stroke={COLORS.phosphor} strokeWidth="1.2"
               strokeDasharray="6 3" opacity="0.6" />
-            {/* Per-assignment sub-regions */}
             {assignments.map((a, ai) => {
               const col = colors[ai % colors.length];
               const hasRegion = a.region && a.region !== pa.polygon && a.region.length >= 3;
@@ -294,7 +459,7 @@ export const MapView = ({ state, dispatch, tool, setTool, deployType, setHover, 
                 <g key={ai}>
                   {hasRegion && (
                     <polygon points={a.region.map((p) => `${p.x},${p.y}`).join(" ")}
-                      fill={`url(#patrol-hatch)`} stroke={col} strokeWidth="0.8"
+                      fill="url(#patrol-hatch)" stroke={col} strokeWidth="0.8"
                       strokeDasharray="4 4" opacity="0.6" />
                   )}
                   {a.path && (
@@ -304,7 +469,6 @@ export const MapView = ({ state, dispatch, tool, setTool, deployType, setHover, 
                 </g>
               );
             })}
-            {/* Polygon vertices */}
             {pa.polygon.map((v, i) => (
               <circle key={i} cx={v.x} cy={v.y} r="2.5" fill={COLORS.phosphor} opacity="0.9" />
             ))}
@@ -322,7 +486,7 @@ export const MapView = ({ state, dispatch, tool, setTool, deployType, setHover, 
           onClick={(z, e) => { if (e.shiftKey) dispatch({ type: "REMOVE_JAM_ZONE", id: z.id }); }} />
       ))}</g>
 
-      {/* USV goal lines */}
+      {/* ── USV goal lines ─────────────────────────────────────────────────── */}
       <g>{state.units.filter((u) => u.goal && u.faction === "friendly").map((u) => (
         <g key={`goal-${u.id}`}>
           <line x1={u.x} y1={u.y} x2={u.goal.x} y2={u.goal.y}
@@ -334,7 +498,7 @@ export const MapView = ({ state, dispatch, tool, setTool, deployType, setHover, 
         </g>
       ))}</g>
 
-      {/* UAV mission target lines */}
+      {/* ── UAV mission target lines ───────────────────────────────────────── */}
       <g>{state.units
         .filter((u) => u.type === "UAV" && u.missionTarget &&
                        (u.state === "flying_to_mission" || u.state === "mission_orbit"))
@@ -345,19 +509,17 @@ export const MapView = ({ state, dispatch, tool, setTool, deployType, setHover, 
               <animate attributeName="stroke-dashoffset" from="0" to="-9" dur="1s" repeatCount="indefinite" />
             </line>
             <g transform={`translate(${u.missionTarget.x},${u.missionTarget.y})`}>
-              <circle r="16" fill="none" stroke={COLORS.amber} strokeWidth="1" opacity="0.5"
-                      strokeDasharray="4 4" />
+              <circle r="16" fill="none" stroke={COLORS.amber} strokeWidth="1" opacity="0.5" strokeDasharray="4 4" />
               <circle r="4" fill="none" stroke={COLORS.amber} strokeWidth="1.5" opacity="0.9" />
               <text y="-22" textAnchor="middle" fontSize="7"
-                fontFamily="'JetBrains Mono', monospace"
-                fill={COLORS.amber} letterSpacing="0.15em">
+                fontFamily="'JetBrains Mono', monospace" fill={COLORS.amber} letterSpacing="0.15em">
                 {u.state === "mission_orbit" ? "▶ ON-STATION" : "▶ EN ROUTE"}
               </text>
             </g>
           </g>
         ))}</g>
 
-      {/* Engage / track target lines */}
+      {/* ── Engage / track target lines ────────────────────────────────────── */}
       <g>{state.units
         .filter((u) => u.engageTargetId && u.faction === "friendly")
         .map((u) => {
@@ -366,20 +528,15 @@ export const MapView = ({ state, dispatch, tool, setTool, deployType, setHover, 
           return (
             <g key={`track-${u.id}`}>
               <line x1={u.x} y1={u.y} x2={tgt.x} y2={tgt.y}
-                stroke={COLORS.amber} strokeWidth="1.2"
-                strokeDasharray="6 3" opacity="0.7">
-                <animate attributeName="stroke-dashoffset" from="0" to="-9"
-                  dur="1s" repeatCount="indefinite" />
+                stroke={COLORS.amber} strokeWidth="1.2" strokeDasharray="6 3" opacity="0.7">
+                <animate attributeName="stroke-dashoffset" from="0" to="-9" dur="1s" repeatCount="indefinite" />
               </line>
               <g transform={`translate(${tgt.x},${tgt.y})`}>
-                <circle r="14" fill="none" stroke={COLORS.amber}
-                  strokeWidth="1" opacity="0.7">
-                  <animate attributeName="r" values="14;20;14"
-                    dur="2s" repeatCount="indefinite" />
+                <circle r="14" fill="none" stroke={COLORS.amber} strokeWidth="1" opacity="0.7">
+                  <animate attributeName="r" values="14;20;14" dur="2s" repeatCount="indefinite" />
                 </circle>
                 <text y="-22" textAnchor="middle" fontSize="7"
-                  fontFamily="'JetBrains Mono', monospace"
-                  fill={COLORS.amber} letterSpacing="0.15em">
+                  fontFamily="'JetBrains Mono', monospace" fill={COLORS.amber} letterSpacing="0.15em">
                   ▶ TRACK
                 </text>
               </g>
@@ -387,6 +544,7 @@ export const MapView = ({ state, dispatch, tool, setTool, deployType, setHover, 
           );
         })}</g>
 
+      {/* ── Sensor circles ─────────────────────────────────────────────────── */}
       <g opacity="0.18">{sensorCircles.map((s) => (
         <circle key={`sens-${s.id}`} cx={s.x} cy={s.y} r={s.r}
           fill="none" stroke={COLORS.phosphor} strokeWidth="0.8" strokeDasharray="2 6" />
@@ -400,18 +558,16 @@ export const MapView = ({ state, dispatch, tool, setTool, deployType, setHover, 
           fill="none" stroke={COLORS.subsurface} strokeWidth="0.6" strokeDasharray="1 3" />
       ))}</g>
 
-      {/* AIS ships */}
+      {/* ── AIS ships ──────────────────────────────────────────────────────── */}
       <g>{state.aisShips.map((ship) => {
-        const tracking = state.units.some(
-          (u) => u.type === "USV" && u.aisEngageMMSI === ship.mmsi
-        );
+        const tracking = state.units.some((u) => u.type === "USV" && u.aisEngageMMSI === ship.mmsi);
         return (
           <AISShipGlyph key={ship.mmsi} ship={ship}
             tracking={tracking} onContextMenu={onAISContextMenu} />
         );
       })}</g>
 
-      {/* Patrol drawing preview */}
+      {/* ── Patrol drawing preview ─────────────────────────────────────────── */}
       {tool === "patrol" && patrolPoints.length > 0 && hoverWorld && (
         <g>
           <polyline points={[...patrolPoints, hoverWorld].map((p) => `${p.x},${p.y}`).join(" ")}
@@ -425,22 +581,56 @@ export const MapView = ({ state, dispatch, tool, setTool, deployType, setHover, 
       {dragBox && (
         <rect x={Math.min(dragBox.x0, dragBox.x1)} y={Math.min(dragBox.y0, dragBox.y1)}
           width={Math.abs(dragBox.x1 - dragBox.x0)} height={Math.abs(dragBox.y1 - dragBox.y0)}
-          fill="rgba(184,255,94,0.05)" stroke={COLORS.phosphor}
-          strokeWidth="1" strokeDasharray="3 3" />
+          fill="rgba(184,255,94,0.05)" stroke={COLORS.phosphor} strokeWidth="1" strokeDasharray="3 3" />
       )}
 
+      {/* ── Units ──────────────────────────────────────────────────────────── */}
       <g>{state.units.map((u) => (
         <UnitGlyph key={u.id} unit={u}
           selected={state.selectedIds.includes(u.id)}
           detected={state.detections[u.id]}
           onClick={onClickUnit}
           onContextMenu={onUnitContextMenu}
+          isAutoTracked={u.faction !== "friendly" && trackedIds.has(u.id)}
           canTrack={u.faction !== "friendly" && hasUSVSelected &&
             (state.detections[u.id]?.confidence ?? 0) >= CONFIG.POSSIBLE_THRESHOLD} />
       ))}</g>
 
-      <rect x="0" y="0" width={CONFIG.WORLD_W} height={CONFIG.WORLD_H}
-        fill="rgba(2,8,5,0.18)" mask="url(#fog-mask)" pointerEvents="none" />
+      {/* ── Mine markers (persistent, click × to remove) ───────────────────── */}
+      <g>{(state.mineMarkers || []).map((marker) => (
+        <g key={marker.id} transform={`translate(${marker.x},${marker.y})`}>
+          {/* Marker body */}
+          <circle r="18" fill="rgba(255,184,74,0.08)" stroke={COLORS.amber}
+                  strokeWidth="1.5" strokeDasharray="4 3" />
+          {/* X symbol */}
+          <line x1="-9" y1="-9" x2="9" y2="9" stroke={COLORS.amber} strokeWidth="2.5" />
+          <line x1="-9" y1="9" x2="9" y2="-9" stroke={COLORS.amber} strokeWidth="2.5" />
+          {/* Label */}
+          <text y="-24" textAnchor="middle" fontSize="7.5"
+                fontFamily="'JetBrains Mono', monospace"
+                fill={COLORS.amber} letterSpacing="0.1em">
+            ⚠ MINE · {marker.label}
+          </text>
+          {/* Remove button — always visible at top-right */}
+          <g transform="translate(18,-18)"
+             style={{ cursor: "pointer" }}
+             onMouseDown={(e) => {
+               e.stopPropagation();
+               dispatch({ type: "REMOVE_MINE_MARKER", id: marker.id });
+             }}>
+            <circle r="9" fill={COLORS.hostile} opacity="0.85" />
+            <text textAnchor="middle" dominantBaseline="central"
+                  fontSize="12" fill="white" fontWeight="bold"
+                  fontFamily="'JetBrains Mono', monospace" y="0.5">×</text>
+          </g>
+        </g>
+      ))}</g>
+
+      {/* ── Fog of war (conditional) ───────────────────────────────────────── */}
+      {fogEnabled && (
+        <rect x={cam.x} y={cam.y} width={vbW} height={vbH}
+          fill={fogFill} mask="url(#fog-mask)" pointerEvents="none" />
+      )}
     </svg>
   );
 };

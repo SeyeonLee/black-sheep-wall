@@ -10,7 +10,7 @@ export const angleOf = (dx, dy) => Math.atan2(dy, dx);
 export const rad2deg = (r) => (r * 180) / Math.PI;
 export const isUnderwater = (u) => u.type === "SUBMARINE" || u.type === "MINE";
 
-// Linear Mercator approximation — First Island Chain (116°E–148°E, 5°N–42°N)
+// Linear projection — Indo-Pacific (60°E–180°E, 20°S–70°N)
 export const geoToWorld = (lat, lon) => ({
   x: ((lon - CONFIG.GEO_LON_MIN) / (CONFIG.GEO_LON_MAX - CONFIG.GEO_LON_MIN)) * CONFIG.WORLD_W,
   y: ((CONFIG.GEO_LAT_MAX - lat)  / (CONFIG.GEO_LAT_MAX - CONFIG.GEO_LAT_MIN)) * CONFIG.WORLD_H,

@@ -1,6 +1,13 @@
 import { CONFIG } from "../config";
 import { dist, norm, clamp, angleOf, isUnderwater } from "../utils";
 import { newId } from "./factories";
+import { isOnLand } from "./landData";
+
+// Wrapper: only move if next position is in water. UAVs ignore land.
+const moveIfWater = (unit, nx, ny) =>
+  (unit.type === "UAV" || !isOnLand(nx, ny))
+    ? { x: nx, y: ny }
+    : { x: unit.x, y: unit.y }; // blocked — stay put
 
 export const tickUnit = (u, units, jamZones, dt) => {
   const next = { ...u };
@@ -112,8 +119,8 @@ export const tickUnit = (u, units, jamZones, dt) => {
       const dx = u.x - inJam.x, dy = u.y - inJam.y;
       const d = Math.hypot(dx, dy) || 1;
       const v = { x: dx / d, y: dy / d };
-      next.x = u.x + v.x * CONFIG.USV_SPEED * dt;
-      next.y = u.y + v.y * CONFIG.USV_SPEED * dt;
+      const pos = moveIfWater(u, u.x + v.x * CONFIG.USV_SPEED * dt, u.y + v.y * CONFIG.USV_SPEED * dt);
+      next.x = pos.x; next.y = pos.y;
       next.heading = angleOf(v.x, v.y);
       next.state = "jammed";
       next.battery = Math.max(0, u.battery - CONFIG.USV_BATTERY_DRAIN * dt);
@@ -133,8 +140,8 @@ export const tickUnit = (u, units, jamZones, dt) => {
         const d = Math.hypot(dx, dy);
         if (d > CONFIG.TRACK_STANDOFF) {
           const vv = norm({ x: dx, y: dy });
-          next.x = u.x + vv.x * CONFIG.USV_SPEED * dt;
-          next.y = u.y + vv.y * CONFIG.USV_SPEED * dt;
+          const pos = moveIfWater(u, u.x + vv.x * CONFIG.USV_SPEED * dt, u.y + vv.y * CONFIG.USV_SPEED * dt);
+          next.x = pos.x; next.y = pos.y;
         }
         next.heading = angleOf(dx, dy);
         next.state = "tracking";
@@ -156,8 +163,8 @@ export const tickUnit = (u, units, jamZones, dt) => {
         else { next.goal = null; next.state = "idle"; }
       } else {
         const v = norm({ x: dx, y: dy });
-        next.x = u.x + v.x * CONFIG.USV_SPEED * dt;
-        next.y = u.y + v.y * CONFIG.USV_SPEED * dt;
+        const pos = moveIfWater(u, u.x + v.x * CONFIG.USV_SPEED * dt, u.y + v.y * CONFIG.USV_SPEED * dt);
+        next.x = pos.x; next.y = pos.y;
         next.heading = angleOf(dx, dy);
         next.state = u.patrolPath ? "patrolling" : "moving";
       }
@@ -173,17 +180,24 @@ export const tickUnit = (u, units, jamZones, dt) => {
     const dx = u.goal.x - u.x, dy = u.goal.y - u.y;
     const d = Math.hypot(dx, dy);
     if (d < 10) {
-      next.goal = {
-        x: clamp(u.x + (Math.random() - 0.5) * 1800, 100, CONFIG.WORLD_W - 100),
-        y: clamp(u.y + (Math.random() - 0.5) * 1800, 100, CONFIG.WORLD_H - 100),
-      };
+      // Pick a new random goal; submarines/enemies avoid land
+      let newGoal;
+      let attempts = 0;
+      do {
+        newGoal = {
+          x: clamp(u.x + (Math.random() - 0.5) * 1800, 100, CONFIG.WORLD_W - 100),
+          y: clamp(u.y + (Math.random() - 0.5) * 1800, 100, CONFIG.WORLD_H - 100),
+        };
+        attempts++;
+      } while (u.type !== "ENEMY" && isOnLand(newGoal.x, newGoal.y) && attempts < 8);
+      next.goal = newGoal;
     } else {
       const speed = u.type === "ENEMY" ? CONFIG.ENEMY_SPEED :
                     u.type === "SUBMARINE" ? CONFIG.SUBMARINE_SPEED :
                     CONFIG.COMMERCIAL_SPEED;
       const v = norm({ x: dx, y: dy });
-      next.x = u.x + v.x * speed * dt;
-      next.y = u.y + v.y * speed * dt;
+      const pos = moveIfWater(u, u.x + v.x * speed * dt, u.y + v.y * speed * dt);
+      next.x = pos.x; next.y = pos.y;
       next.heading = angleOf(dx, dy);
     }
   }
@@ -259,15 +273,23 @@ export const generateAlerts = (units, detections, prevAlerts, jamEvents, simTime
           kind: "MINE", severity: "high", title: `CONFIRMED MINE — ${u.label}`,
           body: "Submerged mine confirmed. Maintain standoff.", unitId: u.id, time: simTime });
     } else if (u.type === "SUBMARINE") {
+      if (det.confidence > CONFIG.POSSIBLE_THRESHOLD && !has(`sub-pos-${u.id}`))
+        alerts.unshift({ id: newId("alt"), eventId: `sub-pos-${u.id}`,
+          kind: "SUBSURFACE", severity: "med", title: `POSSIBLE SUB — ${u.label}`,
+          body: "Sonar contact: submerged track. Auto-tracking nearest USV.", unitId: u.id, time: simTime });
       if (det.confidence > CONFIG.CONFIRMED_THRESHOLD && !has(`sub-${u.id}`))
         alerts.unshift({ id: newId("alt"), eventId: `sub-${u.id}`,
-          kind: "SUBSURFACE", severity: "high", title: `SUBSURFACE CONTACT — ${u.label}`,
+          kind: "SUBSURFACE", severity: "high", title: `CONFIRMED SUB — ${u.label}`,
           body: "Submerged hostile confirmed.", unitId: u.id, time: simTime });
     } else if (u.faction === "hostile") {
+      if (det.confidence > CONFIG.POSSIBLE_THRESHOLD && !has(`hos-pos-${u.id}`))
+        alerts.unshift({ id: newId("alt"), eventId: `hos-pos-${u.id}`,
+          kind: "DETECT", severity: "med", title: `POSSIBLE HOSTILE — ${u.label}`,
+          body: "Unidentified contact in sensor envelope.", unitId: u.id, time: simTime });
       if (det.confidence > CONFIG.CONFIRMED_THRESHOLD && !has(`hos-${u.id}`))
         alerts.unshift({ id: newId("alt"), eventId: `hos-${u.id}`,
           kind: "DETECT", severity: "high", title: `HOSTILE CONFIRMED — ${u.label}`,
-          body: "Enemy vessel inside sensor envelope.", unitId: u.id, time: simTime });
+          body: "Enemy vessel confirmed. Engaging.", unitId: u.id, time: simTime });
     }
   });
 

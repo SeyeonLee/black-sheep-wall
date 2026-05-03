@@ -1,7 +1,7 @@
 import { useRef } from "react";
 import { CONFIG, COLORS } from "../../config";
 import { isUnderwater } from "../../utils";
-import { LAND } from "../../sim/factories";
+import { getLandPolygons } from "../../sim/landData";
 
 export const TacticalOverviewPanel = ({ state, cam, setCam }) => {
   const ref = useRef(null);
@@ -24,7 +24,10 @@ export const TacticalOverviewPanel = ({ state, cam, setCam }) => {
         style={{ background: COLORS.ocean1, border: `1px solid ${COLORS.border}`,
                  width: "100%", height: "100%", cursor: "crosshair" }}
         onClick={onClick} preserveAspectRatio="xMidYMid meet">
-        {LAND.map((d, i) => <path key={i} d={d} fill={COLORS.land} stroke={COLORS.borderHi} strokeWidth="2" />)}
+        {getLandPolygons().map(({ points }, i) => (
+          <polygon key={i} points={points.map((p) => `${p.x},${p.y}`).join(" ")}
+            fill={COLORS.land} stroke={COLORS.borderHi} strokeWidth="2" />
+        ))}
         {state.patrolAreas.map((pa) => (
           <polygon key={pa.id} points={pa.polygon.map((p) => `${p.x},${p.y}`).join(" ")}
             fill={COLORS.phosphor} fillOpacity="0.15" stroke={COLORS.phosphor} strokeWidth="6" />
