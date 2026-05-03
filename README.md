@@ -492,8 +492,8 @@ UAV_RETURN_BATTERY_MARGIN: 8  // % battery safety pad for proactive RTB
 ## Team
 
 <!-- Add team members here -->
-Seyeon Lee (https://www.linkedin.com/in/seyeonlee/)
-Jacob Nyhagen (https://www.linkedin.com/in/jacob-nyhagen-616b8427b/)
+- Seyeon Lee (https://www.linkedin.com/in/seyeonlee/)
+- Jacob Nyhagen (https://www.linkedin.com/in/jacob-nyhagen-616b8427b/)
 ---
 
 *Built for the [CerebralValley 3rd Annual NatSec Hackathon](https://cerebralvalley.ai/e/3rd-annual-natsec-hackathon)*
