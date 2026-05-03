@@ -45,6 +45,14 @@ const CONFIG = {
   JAM_ZONE_RADIUS: 280,
   PATROL_LANES: 6,
   TRACK_STANDOFF: 90,
+
+  // Geographic projection — Yellow Sea / Korea Strait region
+  // ISR-1 spawns at (2000,1300) ≈ 132.5°E, 37.2°N (Yellow Sea)
+  GEO_LON_MIN: 120, GEO_LON_MAX: 145,   // 25° span → 4000 world units
+  GEO_LAT_MIN: 30,  GEO_LAT_MAX: 45,    // 15° span → 2500 world units
+  AIS_RANGE_DEG: 3,                       // bounding box padding for fetch
+  AIS_FETCH_MS: 60000,                    // refresh every 60 s
+  AIS_SHIP_VISIBLE_RANGE: 350,            // world units — radius to show AIS labels
 };
 
 const COLORS = {
@@ -56,6 +64,7 @@ const COLORS = {
   hostile: "#ff4757", hostileDim: "#a82a36",
   neutral: "#5fb3d4", neutralDim: "#3a6b80",
   subsurface: "#c66bff", subsurfaceDim: "#7a3ea3",
+  ais: "#29e0d4", aisDim: "#1a8a83",
   text: "#c8d4cc", textDim: "#6b7d72",
 };
 
@@ -69,6 +78,33 @@ const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 const angleOf = (dx, dy) => Math.atan2(dy, dx);
 const rad2deg = (r) => (r * 180) / Math.PI;
 const isUnderwater = (u) => u.type === "SUBMARINE" || u.type === "MINE";
+
+// ─── GEO PROJECTION ──────────────────────────────────────────────────────────
+// Linear Mercator approximation — accurate enough for the ~15°×25° viewport.
+const geoToWorld = (lat, lon) => ({
+  x: ((lon - CONFIG.GEO_LON_MIN) / (CONFIG.GEO_LON_MAX - CONFIG.GEO_LON_MIN)) * CONFIG.WORLD_W,
+  y: ((CONFIG.GEO_LAT_MAX - lat)  / (CONFIG.GEO_LAT_MAX - CONFIG.GEO_LAT_MIN)) * CONFIG.WORLD_H,
+});
+const worldToGeo = (x, y) => ({
+  lon: CONFIG.GEO_LON_MIN + (x / CONFIG.WORLD_W) * (CONFIG.GEO_LON_MAX - CONFIG.GEO_LON_MIN),
+  lat: CONFIG.GEO_LAT_MAX - (y / CONFIG.WORLD_H) * (CONFIG.GEO_LAT_MAX - CONFIG.GEO_LAT_MIN),
+});
+
+// AIS vessel type code → label
+const decodeAISType = (code) => {
+  const n = parseInt(code) || 0;
+  if (n >= 70 && n <= 79) return "CARGO";
+  if (n >= 80 && n <= 89) return "TANKER";
+  if (n >= 60 && n <= 69) return "PASSENGER";
+  if (n >= 40 && n <= 49) return "HSC";
+  if (n === 30)            return "FISHING";
+  if (n === 31 || n === 32) return "TUG";
+  if (n === 35 || n === 36 || n === 37) return "SAILING";
+  if (n >= 20 && n <= 29)  return "WIG";
+  if (n === 50 || n === 51 || n === 52 || n === 55) return "SPECIAL";
+  if (n >= 90 && n <= 99)  return "OTHER";
+  return "UNKNOWN";
+};
 
 // ─── PHASE 2: PROPER POLYGON-CLIPPED SWEEP PATH ──────────────────────────────
 // Standard scan-line: for each horizontal line, find polygon-edge intersections,
@@ -127,7 +163,7 @@ const createISRUnit = (x, y, n = 1) => {
   return [
     { id: usvId, type: "USV", faction: "friendly", x, y, heading: 0, battery: 92,
       state: "idle", goal: null, label: `ISR-${n}`, patrolPath: null, patrolIdx: 0,
-      engageTargetId: null },
+      engageTargetId: null, aisEngageMMSI: null },
     { id: newId("uav"), type: "UAV", faction: "friendly", x, y, heading: 0, battery: 88,
       state: "orbiting", parentId: usvId, orbitAngle: 0, label: "α" },
     { id: newId("uav"), type: "UAV", faction: "friendly", x, y, heading: 0, battery: 100,
@@ -185,7 +221,8 @@ const makeInitialState = () => {
     detections: {},
     alerts: [],
     patrolAreas: [],
-    jamZones: [],         // Phase 2
+    jamZones: [],
+    aisShips: [],          // Phase 3: live AIS feed
     selectedIds: [],
     fogReveal: [],
     simSpeed: 1, paused: false, simTime: 0,
@@ -275,14 +312,20 @@ const tickUnit = (u, units, jamZones, dt) => {
       return next;
     }
 
-    // Phase 2.1: TRACK contact (right-click on detected non-friendly)
-    if (u.engageTargetId) {
-      const tgt = units.find((x) => x.id === u.engageTargetId);
-      if (!tgt) {
-        next.engageTargetId = null;
-        next.state = "idle";
-      } else {
-        const dx = tgt.x - u.x, dy = tgt.y - u.y;
+    // Phase 2.1 + 3: TRACK — deployed unit or live AIS ship
+    if (u.engageTargetId || u.aisEngageMMSI) {
+      let tgtPos = null;
+      let tgtLabel = null;
+      if (u.engageTargetId) {
+        const tgt = units.find((x) => x.id === u.engageTargetId);
+        if (tgt) { tgtPos = tgt; tgtLabel = tgt.label; }
+        else next.engageTargetId = null;
+      }
+      // aisShips not available in tickUnit (no closure), handled via goal injection in reducer
+      // If no valid target found, idle
+      if (!tgtPos && !u.aisEngageMMSI) { next.state = "idle"; }
+      else if (tgtPos) {
+        const dx = tgtPos.x - u.x, dy = tgtPos.y - u.y;
         const d = Math.hypot(dx, dy);
         if (d > CONFIG.TRACK_STANDOFF) {
           const vv = norm({ x: dx, y: dy });
@@ -295,6 +338,7 @@ const tickUnit = (u, units, jamZones, dt) => {
         if (next.battery < CONFIG.USV_LOW_BATTERY) next.state = "charging";
         return next;
       }
+      // aisEngageMMSI: goal is injected by reducer each tick; fall through to goal logic below
     }
 
     let target = u.goal;
@@ -459,7 +503,7 @@ const clearOrdersForUSVs = (state, usvIds) => ({
   units: state.units.map((u) =>
     usvIds.includes(u.id)
       ? { ...u, goal: null, patrolPath: null, patrolIdx: 0,
-          engageTargetId: null, state: "idle" }
+          engageTargetId: null, aisEngageMMSI: null, state: "idle" }
       : u
   ),
   patrolAreas: state.patrolAreas.filter(
@@ -471,7 +515,18 @@ const reducer = (state, action) => {
   switch (action.type) {
     case "TICK": {
       const dt = state.simSpeed;
-      let units = state.units.map((u) => tickUnit(u, state.units, state.jamZones, dt));
+      // Inject AIS-tracking goal into USVs before tick (so tickUnit sees it as goal)
+      const preUnits = state.units.map((u) => {
+        if (u.type !== "USV" || !u.aisEngageMMSI) return u;
+        const ship = state.aisShips.find((s) => s.mmsi === u.aisEngageMMSI);
+        if (!ship) return { ...u, aisEngageMMSI: null, state: "idle" };
+        const standoffPt = {
+          x: ship.wx + (u.x - ship.wx) / Math.max(1, Math.hypot(u.x - ship.wx, u.y - ship.wy)) * CONFIG.TRACK_STANDOFF,
+          y: ship.wy + (u.y - ship.wy) / Math.max(1, Math.hypot(u.x - ship.wx, u.y - ship.wy)) * CONFIG.TRACK_STANDOFF,
+        };
+        return { ...u, goal: standoffPt, state: "tracking" };
+      });
+      let units = preUnits.map((u) => tickUnit(u, preUnits, state.jamZones, dt));
       units = applyUAVRotation(units);
       const detections = updateDetections(units, state.detections, dt);
       // Phase 2.1: track jam events for both UAVs and USVs
@@ -558,6 +613,22 @@ const reducer = (state, action) => {
       return { ...state, jamZones: [...state.jamZones, createJamZone(action.x, action.y)] };
     case "REMOVE_JAM_ZONE":
       return { ...state, jamZones: state.jamZones.filter((j) => j.id !== action.id) };
+
+    case "SET_AIS_SHIPS":
+      return { ...state, aisShips: action.ships };
+    case "ENGAGE_AIS_TARGET": {
+      const usvIds = state.units
+        .filter((u) => state.selectedIds.includes(u.id) && u.type === "USV")
+        .map((u) => u.id);
+      if (usvIds.length === 0) return state;
+      const cleared = clearOrdersForUSVs(state, usvIds);
+      const units = cleared.units.map((u) =>
+        usvIds.includes(u.id)
+          ? { ...u, aisEngageMMSI: action.mmsi, state: "tracking" }
+          : u
+      );
+      return { ...state, units, patrolAreas: cleared.patrolAreas };
+    }
 
     case "DISMISS_ALERT":
       return { ...state, alerts: state.alerts.filter((a) => a.id !== action.id) };
@@ -754,6 +825,41 @@ const JamZoneGlyph = ({ zone, onClick }) => (
   </g>
 );
 
+// ─── AIS SHIP GLYPH — real-world AIS contacts ────────────────────────────────
+// Rendered separately from deployed units; never on minimap.
+const AISShipGlyph = ({ ship, tracking, onContextMenu }) => {
+  const headingRad = ((ship.heading || ship.cog || 0) * Math.PI) / 180;
+  const headingDeg = ship.heading || ship.cog || 0;
+  return (
+    <g transform={`translate(${ship.wx},${ship.wy})`}
+       style={{ cursor: "context-menu" }}
+       onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); onContextMenu(ship, e); }}>
+      {tracking && (
+        <circle r="18" fill="none" stroke={COLORS.ais} strokeWidth="1" opacity="0.8">
+          <animate attributeName="r" values="18;24;18" dur="2s" repeatCount="indefinite" />
+        </circle>
+      )}
+      {/* Ship silhouette — direction arrow */}
+      <g transform={`rotate(${headingDeg})`}>
+        <polygon points="0,-10 6,6 0,3 -6,6" fill={COLORS.ais} opacity="0.85" />
+      </g>
+      {/* Name + type */}
+      <text x="11" y="-6" fontSize="8" fontFamily="'JetBrains Mono', monospace"
+            fill={COLORS.ais} opacity="0.9">
+        {ship.name?.slice(0, 14) || ship.mmsi}
+      </text>
+      <text x="11" y="3" fontSize="6.5" fontFamily="'JetBrains Mono', monospace"
+            fill={COLORS.aisDim}>
+        {ship.type} · {ship.sog?.toFixed(1) || "0"}kn · {ship.flag || "—"}
+      </text>
+      <text x="11" y="11" fontSize="6" fontFamily="'JetBrains Mono', monospace"
+            fill={COLORS.aisDim} opacity="0.7">
+        MMSI {ship.mmsi}
+      </text>
+    </g>
+  );
+};
+
 // ─── MAP VIEW ────────────────────────────────────────────────────────────────
 const MapView = ({ state, dispatch, tool, setTool, deployType, setHover, setCursorWorld, cam, setCam }) => {
   const svgRef = useRef(null);
@@ -921,6 +1027,12 @@ const MapView = ({ state, dispatch, tool, setTool, deployType, setHover, setCurs
     dispatch({ type: "ENGAGE_TARGET", targetId: u.id });
   };
 
+  // Phase 3: right-click on AIS ship → TRACK via MMSI
+  const onAISContextMenu = (ship, e) => {
+    if (state.selectedIds.length === 0) return;
+    dispatch({ type: "ENGAGE_AIS_TARGET", mmsi: ship.mmsi });
+  };
+
   const sensorCircles = state.units
     .filter((u) => u.faction === "friendly" && u.state !== "docked" && u.state !== "jammed")
     .map((u) => ({
@@ -934,11 +1046,10 @@ const MapView = ({ state, dispatch, tool, setTool, deployType, setHover, setCurs
 
   return (
     <svg ref={svgRef}
-      className="select-none w-full h-full"
       style={{
-        background: COLORS.ocean1,
+        background: COLORS.ocean1, userSelect: "none",
+        display: "block", width: "100%", height: "100%",
         cursor: tool === "patrol" ? "crosshair" : tool === "deploy" ? "copy" : "default",
-        display: "block",
       }}
       viewBox={`${cam.x} ${cam.y} ${vbW} ${vbH}`}
       onMouseDown={onMouseDown} onMouseMove={onMouseMove}
@@ -962,7 +1073,7 @@ const MapView = ({ state, dispatch, tool, setTool, deployType, setHover, setCurs
           {state.fogReveal.map((r, i) => (
             <radialGradient key={i} id={`reveal-${i}`}>
               <stop offset="0%" stopColor="black" />
-              <stop offset="70%" stopColor="black" />
+              <stop offset="65%" stopColor="black" />
               <stop offset="100%" stopColor="white" />
             </radialGradient>
           ))}
@@ -970,6 +1081,14 @@ const MapView = ({ state, dispatch, tool, setTool, deployType, setHover, setCurs
             <circle key={i} cx={r.x} cy={r.y} r={r.r} fill={`url(#reveal-${i})`} />
           ))}
         </mask>
+        {/* Sensor glow gradients — subtle brightness boost in monitored areas */}
+        {sensorCircles.map((s) => (
+          <radialGradient key={`sg-${s.id}`} id={`sg-${s.id}`}>
+            <stop offset="0%" stopColor={COLORS.phosphor} stopOpacity="0.07" />
+            <stop offset="80%" stopColor={COLORS.phosphor} stopOpacity="0.03" />
+            <stop offset="100%" stopColor={COLORS.phosphor} stopOpacity="0" />
+          </radialGradient>
+        ))}
         <pattern id="patrol-hatch" width="8" height="8" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
           <line x1="0" y1="0" x2="0" y2="8" stroke={COLORS.phosphor} strokeWidth="0.6" opacity="0.4" />
         </pattern>
@@ -1066,10 +1185,26 @@ const MapView = ({ state, dispatch, tool, setTool, deployType, setHover, setCurs
         <circle key={`sens-${s.id}`} cx={s.x} cy={s.y} r={s.r}
           fill="none" stroke={COLORS.phosphor} strokeWidth="0.8" strokeDasharray="2 6" />
       ))}</g>
+      {/* Sensor glow: subtle phosphor brightness in actively monitored areas */}
+      <g>{sensorCircles.map((s) => (
+        <circle key={`glow-${s.id}`} cx={s.x} cy={s.y} r={s.r}
+          fill={`url(#sg-${s.id})`} pointerEvents="none" />
+      ))}</g>
       <g opacity="0.25">{sensorCircles.filter((s) => s.sonar > 0).map((s) => (
         <circle key={`son-${s.id}`} cx={s.x} cy={s.y} r={s.sonar}
           fill="none" stroke={COLORS.subsurface} strokeWidth="0.6" strokeDasharray="1 3" />
       ))}</g>
+
+      {/* Phase 3: AIS ships — real-world contacts, main map only */}
+      <g>{state.aisShips.map((ship) => {
+        const tracking = state.units.some(
+          (u) => u.type === "USV" && u.aisEngageMMSI === ship.mmsi
+        );
+        return (
+          <AISShipGlyph key={ship.mmsi} ship={ship}
+            tracking={tracking} onContextMenu={onAISContextMenu} />
+        );
+      })}</g>
 
       {tool === "patrol" && patrolPoints.length > 0 && hoverWorld && (
         <g>
@@ -1096,63 +1231,112 @@ const MapView = ({ state, dispatch, tool, setTool, deployType, setHover, setCurs
           onContextMenu={onUnitContextMenu} />
       ))}</g>
 
+      {/* Fog: very light — map always readable; monitored zones slightly brighter via sensor glow */}
       <rect x="0" y="0" width={CONFIG.WORLD_W} height={CONFIG.WORLD_H}
-        fill="rgba(2,8,5,0.78)" mask="url(#fog-mask)" pointerEvents="none" />
+        fill="rgba(2,8,5,0.18)" mask="url(#fog-mask)" pointerEvents="none" />
     </svg>
   );
 };
 
 // ─── TOP BAR ─────────────────────────────────────────────────────────────────
-const TopBar = ({ state, dispatch }) => {
+const TopBar = ({ state, dispatch, aisUsername, setAisUsername, aisStatus, onRefreshAIS }) => {
   const { paused, simSpeed, simTime } = state;
   const speeds = [1, 5, 20, 100];
   const hh = String(Math.floor(simTime / 3600)).padStart(2, "0");
   const mm = String(Math.floor((simTime % 3600) / 60)).padStart(2, "0");
   const ss = String(Math.floor(simTime % 60)).padStart(2, "0");
+  const [aisDraft, setAisDraft] = useState("");
+
+  const aisStatusColor = aisStatus === "ok" ? COLORS.ais :
+                         aisStatus === "fetching" ? COLORS.amber :
+                         aisStatus === "error" ? COLORS.hostile : COLORS.textDim;
 
   return (
-    <div className="flex items-center justify-between px-4 h-11 border-b shrink-0"
-         style={{ background: COLORS.surface, borderColor: COLORS.border, color: COLORS.text }}>
-      <div className="flex items-center gap-2">
-        <Hexagon size={16} style={{ color: COLORS.phosphor }} className="fill-current" />
-        <span className="font-bold tracking-[0.2em] text-sm" style={{ fontFamily: "'Chakra Petch', monospace" }}>
+    <div style={{
+      display: "flex", alignItems: "center", justifyContent: "space-between",
+      padding: "0 16px", height: 44, flexShrink: 0,
+      borderBottom: `1px solid ${COLORS.border}`,
+      background: COLORS.surface, color: COLORS.text,
+      fontFamily: "'JetBrains Mono', monospace",
+    }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        <Hexagon size={16} style={{ color: COLORS.phosphor }} />
+        <span style={{ fontWeight: 700, letterSpacing: "0.2em", fontSize: 14, fontFamily: "'Chakra Petch', monospace" }}>
           BLACK SHEEP WALL
         </span>
-        <span className="text-xs ml-2" style={{ color: COLORS.textDim }}>// ISR.CMD.v0.3</span>
+        <span style={{ fontSize: 11, marginLeft: 8, color: COLORS.textDim }}>// ISR.CMD.v0.3</span>
       </div>
 
-      <div className="flex items-center gap-4 font-mono text-xs">
-        <div className="flex items-center gap-2" style={{ color: COLORS.phosphorDim }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 12, fontSize: 11, fontFamily: "'JetBrains Mono', monospace" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 6, color: COLORS.phosphorDim }}>
           <Activity size={12} />
-          <span>MISSION TIME</span>
-          <span style={{ color: COLORS.phosphor }} className="tabular-nums">T+{hh}:{mm}:{ss}</span>
+          <span>T+{hh}:{mm}:{ss}</span>
+        </div>
+
+        {/* AISHub connect */}
+        <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+          {aisUsername
+            ? <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                <span style={{ fontSize: 9, color: aisStatusColor }}>
+                  AIS {aisStatus.toUpperCase()}
+                </span>
+                <span style={{ fontSize: 9, color: COLORS.textDim }}>
+                  ({state.aisShips.length})
+                </span>
+                <button onClick={onRefreshAIS}
+                  style={{ fontSize: 9, padding: "0 4px", border: `1px solid ${COLORS.border}`,
+                           color: COLORS.aisDim, background: "transparent", cursor: "pointer" }}>↺</button>
+                <button onClick={() => { setAisUsername(""); setAisDraft(""); }}
+                  style={{ fontSize: 9, padding: "0 4px", border: `1px solid ${COLORS.border}`,
+                           color: COLORS.textDim, background: "transparent", cursor: "pointer" }}>✕</button>
+              </div>
+            : <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                <span style={{ fontSize: 9, color: COLORS.textDim }}>AISHub:</span>
+                <input
+                  type="text" placeholder="username"
+                  value={aisDraft} onChange={(e) => setAisDraft(e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && aisDraft && setAisUsername(aisDraft)}
+                  style={{ fontSize: 9, padding: "0 6px", height: 20, width: 90,
+                           border: `1px solid ${COLORS.border}`, background: COLORS.bg,
+                           color: COLORS.ais, outline: "none", fontFamily: "inherit" }}
+                />
+                <button onClick={() => aisDraft && setAisUsername(aisDraft)}
+                  style={{ fontSize: 9, padding: "0 6px", height: 20, fontWeight: 700,
+                           border: `1px solid ${COLORS.ais}`, color: COLORS.ais,
+                           background: "transparent", cursor: "pointer", fontFamily: "inherit" }}>
+                  CONNECT
+                </button>
+              </div>
+          }
         </div>
 
         <button onClick={() => dispatch({ type: "TOGGLE_PAUSE" })}
-          className="flex items-center gap-1.5 px-2.5 py-1 border transition-colors"
           style={{
-            borderColor: paused ? COLORS.amber : COLORS.border,
+            display: "flex", alignItems: "center", gap: 6, padding: "4px 10px",
+            border: `1px solid ${paused ? COLORS.amber : COLORS.border}`,
             background: paused ? "rgba(255,184,74,0.1)" : "transparent",
             color: paused ? COLORS.amber : COLORS.text,
+            cursor: "pointer", fontFamily: "inherit", fontSize: 11,
           }}>
           {paused ? <Play size={12} /> : <Pause size={12} />}
           <span>{paused ? "RESUME" : "PAUSE"}</span>
         </button>
 
-        <div className="flex items-center border" style={{ borderColor: COLORS.border }}>
+        <div style={{ display: "flex", border: `1px solid ${COLORS.border}` }}>
           {speeds.map((s) => (
             <button key={s} onClick={() => dispatch({ type: "SET_SPEED", speed: s })}
-              className="px-2.5 py-1 transition-colors tabular-nums"
               style={{
+                padding: "4px 10px", fontFamily: "inherit", fontSize: 11,
                 background: simSpeed === s ? COLORS.phosphor : "transparent",
                 color: simSpeed === s ? COLORS.bg : COLORS.text,
                 fontWeight: simSpeed === s ? 700 : 400,
+                border: "none", cursor: "pointer",
               }}>{s}×</button>
           ))}
         </div>
       </div>
 
-      <div className="flex items-center gap-2 text-xs font-mono" style={{ color: COLORS.phosphorDim }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 11, color: COLORS.phosphorDim }}>
         <Power size={12} style={{ color: COLORS.phosphor }} />
         <span>LINK NOMINAL</span>
       </div>
@@ -1162,21 +1346,28 @@ const TopBar = ({ state, dispatch }) => {
 
 // ─── DOCK PANEL FRAME ────────────────────────────────────────────────────────
 const DockPanel = ({ title, icon, width, children, accent = COLORS.phosphorDim, flex }) => (
-  <div className="bsw-dock-panel flex flex-col border-r shrink-0 overflow-hidden"
-       style={{
-         width: flex ? undefined : width,
-         flex: flex ? "1 1 0" : "0 0 auto",
-         minWidth: 0, height: "100%",
-         borderColor: COLORS.border, background: COLORS.surface,
-       }}>
-    <div className="flex items-center gap-1.5 px-3 h-7 border-b shrink-0"
-         style={{ borderColor: COLORS.border, background: COLORS.bg }}>
+  <div style={{
+    display: "flex", flexDirection: "column", flexShrink: 0, overflow: "hidden",
+    width: flex ? undefined : width,
+    flex: flex ? "1 1 0" : undefined,
+    borderRight: `1px solid ${COLORS.border}`,
+    background: COLORS.surface,
+  }}>
+    <div style={{
+      display: "flex", alignItems: "center", gap: 6,
+      padding: "0 12px", height: 28, flexShrink: 0,
+      borderBottom: `1px solid ${COLORS.border}`,
+      background: COLORS.bg,
+    }}>
       {icon}
-      <span className="text-[10px] tracking-[0.25em] font-bold" style={{ color: accent }}>
+      <span style={{
+        fontSize: 10, letterSpacing: "0.25em", fontWeight: 700, color: accent,
+        fontFamily: "'JetBrains Mono', monospace",
+      }}>
         {title}
       </span>
     </div>
-    <div className="flex-1 overflow-hidden">{children}</div>
+    <div style={{ flex: "1 1 0", overflow: "hidden", minHeight: 0 }}>{children}</div>
   </div>
 );
 
@@ -1197,7 +1388,7 @@ const TacticalOverviewPanel = ({ state, cam, setCam }) => {
   const vbW = CONFIG.WORLD_W / cam.zoom, vbH = CONFIG.WORLD_H / cam.zoom;
 
   return (
-    <div className="p-2 h-full flex items-center justify-center">
+    <div style={{ padding: 8, height: "100%", display: "flex", alignItems: "center", justifyContent: "center", boxSizing: "border-box" }}>
       <svg ref={ref} viewBox={`0 0 ${CONFIG.WORLD_W} ${CONFIG.WORLD_H}`}
         style={{ background: COLORS.ocean1, border: `1px solid ${COLORS.border}`,
                  width: "100%", height: "100%", cursor: "crosshair" }}
@@ -1229,7 +1420,10 @@ const TacticalOverviewPanel = ({ state, cam, setCam }) => {
 
 // ─── PANEL: STATUS ───────────────────────────────────────────────────────────
 const Row = ({ k, v, vColor = COLORS.text }) => (
-  <div className="flex justify-between border-b border-dashed pb-0.5" style={{ borderColor: COLORS.border }}>
+  <div style={{
+    display: "flex", justifyContent: "space-between",
+    borderBottom: `1px dashed ${COLORS.border}`, paddingBottom: 2,
+  }}>
     <span style={{ color: COLORS.textDim }}>{k}</span>
     <span style={{ color: vColor }}>{v}</span>
   </div>
@@ -1238,11 +1432,11 @@ const Row = ({ k, v, vColor = COLORS.text }) => (
 const BatteryBar = ({ value }) => {
   const color = value > 60 ? COLORS.phosphor : value > 30 ? COLORS.amber : COLORS.hostile;
   return (
-    <div className="flex items-center gap-1">
-      <div className="w-9 h-1 border" style={{ borderColor: COLORS.border, background: COLORS.bg }}>
+    <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+      <div style={{ width: 36, height: 4, border: `1px solid ${COLORS.border}`, background: COLORS.bg }}>
         <div style={{ width: `${value}%`, height: "100%", background: color }} />
       </div>
-      <span className="text-[9px] tabular-nums" style={{ color, minWidth: "26px" }}>
+      <span style={{ fontSize: 9, color, minWidth: 26 }}>
         {Math.floor(value)}%
       </span>
     </div>
@@ -1263,26 +1457,28 @@ const StatusPanel = ({ state, dispatch }) => {
   };
 
   return (
-    <div className="h-full flex flex-col text-xs font-mono">
-      <div className="p-2 border-b" style={{ borderColor: COLORS.border }}>
-        <div className="text-[9px] tracking-widest mb-1.5" style={{ color: COLORS.textDim }}>
+    <div style={{ height: "100%", display: "flex", flexDirection: "column", fontSize: 12, fontFamily: "'JetBrains Mono', monospace" }}>
+      <div style={{ padding: 8, borderBottom: `1px solid ${COLORS.border}`, flexShrink: 0 }}>
+        <div style={{ fontSize: 9, letterSpacing: "0.1em", marginBottom: 6, color: COLORS.textDim }}>
           FORCE.ROSTER
         </div>
-        <div className="space-y-1 max-h-24 overflow-y-auto" style={{ scrollbarWidth: "thin" }}>
+        <div style={{ display: "flex", flexDirection: "column", gap: 4, maxHeight: 96, overflowY: "auto" }}>
           {friendly.map((u) => {
             const isSel = state.selectedIds.includes(u.id);
             return (
               <button key={u.id} onClick={() => onRosterClick(u)}
-                className="w-full text-left px-2 py-1 border flex items-center justify-between transition-colors"
                 style={{
-                  borderColor: isSel ? COLORS.phosphor : COLORS.border,
+                  width: "100%", textAlign: "left", padding: "4px 8px",
+                  border: `1px solid ${isSel ? COLORS.phosphor : COLORS.border}`,
                   background: isSel ? "rgba(184,255,94,0.06)" : "transparent",
+                  display: "flex", alignItems: "center", justifyContent: "space-between",
+                  cursor: "pointer", fontFamily: "inherit",
                 }}>
-                <div className="flex items-center gap-1.5 min-w-0">
+                <div style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0 }}>
                   {u.type === "USV" && <Anchor size={10} style={{ color: COLORS.phosphor, flexShrink: 0 }} />}
                   {u.type === "UAV" && <Plane size={10} style={{ color: COLORS.phosphor, flexShrink: 0 }} />}
                   <span style={{ color: isSel ? COLORS.phosphor : COLORS.text }}>{u.label}</span>
-                  <span className="text-[9px] truncate" style={{ color: COLORS.textDim }}>
+                  <span style={{ fontSize: 9, color: COLORS.textDim, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                     {u.state.toUpperCase()}
                   </span>
                 </div>
@@ -1293,10 +1489,10 @@ const StatusPanel = ({ state, dispatch }) => {
         </div>
       </div>
 
-      <div className="p-2 flex-1 overflow-y-auto" style={{ scrollbarWidth: "thin" }}>
-        <div className="text-[9px] tracking-widest mb-1.5" style={{ color: COLORS.textDim }}>SELECTED</div>
+      <div style={{ padding: 8, flex: "1 1 0", overflowY: "auto", minHeight: 0 }}>
+        <div style={{ fontSize: 9, letterSpacing: "0.1em", marginBottom: 6, color: COLORS.textDim }}>SELECTED</div>
         {usvSel ? (
-          <div className="space-y-1 text-[10px]" style={{ color: COLORS.text }}>
+          <div style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 10, color: COLORS.text }}>
             <Row k="UNIT" v={usvSel.label} />
             <Row k="TYPE" v={usvSel.type} />
             <Row k="STATE" v={usvSel.state.toUpperCase()}
@@ -1318,15 +1514,18 @@ const StatusPanel = ({ state, dispatch }) => {
             <Row k="GROUP" v={`+${selectedFriendly.length - 1} attached`} />
           </div>
         ) : (
-          <div style={{ color: COLORS.textDim }} className="text-[10px]">
+          <div style={{ color: COLORS.textDim, fontSize: 10 }}>
             // No unit selected.<br />
             // Click roster or drag-box on map.
           </div>
         )}
       </div>
 
-      <div className="px-2 py-1 border-t flex justify-between text-[9px]"
-           style={{ borderColor: COLORS.border, background: COLORS.bg, color: COLORS.textDim }}>
+      <div style={{
+        padding: "4px 8px", borderTop: `1px solid ${COLORS.border}`,
+        display: "flex", justifyContent: "space-between", fontSize: 9,
+        background: COLORS.bg, color: COLORS.textDim, flexShrink: 0,
+      }}>
         <span>GPS: <span style={{ color: state.jamZones.length > 0 ? COLORS.amber : COLORS.phosphor }}>
           {state.jamZones.length > 0 ? "DEGRADED" : "OK"}
         </span></span>
@@ -1340,8 +1539,6 @@ const StatusPanel = ({ state, dispatch }) => {
 };
 
 // ─── PANEL: VISUAL INTEL — PHASE 3 ──────────────────────────────────────────
-// States: no-key → drop-zone → analyzing → results
-// GPT-4o Vision extracts vessel characteristics → compared against nearest AIS contact.
 const VisualIntelPanel = ({ state, dispatch }) => {
   const [apiKey, setApiKey]       = useState("");
   const [keyDraft, setKeyDraft]   = useState("");
@@ -1351,24 +1548,34 @@ const VisualIntelPanel = ({ state, dispatch }) => {
   const [analyzing, setAnalyzing] = useState(false);
   const [extraction, setExtraction]   = useState(null);
   const [comparison, setComparison]   = useState(null);
-  const [aisTarget, setAisTarget]     = useState(null);
+  const [aisTarget, setAisTarget]     = useState(null);  // real AIS ship or null
+  const [deployedTarget, setDeployedTarget] = useState(null); // deployed merchant or null
   const [error, setError]         = useState(null);
   const [isDragOver, setIsDragOver]   = useState(false);
   const fileInputRef = useRef(null);
 
-  const activeUAV  = state.units.find((u) => u.type === "UAV" && u.state === "orbiting");
-  const jammedUAV  = state.units.find((u) => u.type === "UAV" && u.state === "jammed");
+  const activeUAV = state.units.find((u) => u.type === "UAV" && u.state === "orbiting");
+  const jammedUAV = state.units.find((u) => u.type === "UAV" && u.state === "jammed");
 
-  // Find nearest confirmed commercial vessel to the orbiting UAV
-  const findTarget = () => {
-    const ref = activeUAV;
-    if (!ref) return null;
+  // Find nearest REAL AIS ship to orbiting UAV (within a generous range)
+  const findNearestAIS = () => {
+    if (!activeUAV) return null;
+    const pool = state.aisShips.filter((s) => dist(activeUAV, { x: s.wx, y: s.wy }) < 500);
+    if (!pool.length) return null;
+    return pool.reduce((b, s) =>
+      dist(activeUAV, { x: s.wx, y: s.wy }) < dist(activeUAV, { x: b.wx, y: b.wy }) ? s : b
+    );
+  };
+
+  // Find nearest DEPLOYED merchant (simulated) within sensor range
+  const findNearestDeployed = () => {
+    if (!activeUAV) return null;
     const pool = state.units.filter(
       (u) => u.type === "COMMERCIAL" &&
              (state.detections[u.id]?.confidence || 0) > CONFIG.CONFIRMED_THRESHOLD
     );
     if (!pool.length) return null;
-    return pool.reduce((best, u) => dist(ref, u) < dist(ref, best) ? u : best);
+    return pool.reduce((b, u) => dist(activeUAV, u) < dist(activeUAV, b) ? u : b);
   };
 
   const readFile = (file) => {
@@ -1380,41 +1587,45 @@ const VisualIntelPanel = ({ state, dispatch }) => {
       setImageBase64(url.split(",")[1]);
       setImageMime(file.type);
       setExtraction(null); setComparison(null); setError(null);
-      setAisTarget(findTarget());
+      setAisTarget(findNearestAIS());
+      setDeployedTarget(findNearestDeployed());
     };
     reader.readAsDataURL(file);
   };
 
-  const compareWithAIS = (ex, unit) => {
-    if (!unit) return { match: true, diffs: [] };
+  // Compare GPT-4o extraction against a real AIS ship
+  const compareWithRealAIS = (ex, ship) => {
     const n = (s) => (s || "").toUpperCase().trim();
     const diffs = [];
-    const cvType = n(ex.vesselType), aisType = n(unit.vesselType);
-    if (cvType && cvType !== "UNKNOWN" && aisType && cvType !== aisType)
+    const cvType = n(ex.vesselType), aisType = n(ship.type);
+    if (cvType && cvType !== "UNKNOWN" && aisType && aisType !== "UNKNOWN" && cvType !== aisType)
       diffs.push({ field: "TYPE", cv: cvType, ais: aisType });
-    if (cvType === "MILITARY" && aisType !== "MILITARY")
+    if (cvType === "MILITARY" && !["MILITARY","SPECIAL"].includes(aisType))
       diffs.push({ field: "CLASS", cv: "MILITARY ASSET", ais: "CIVILIAN AIS" });
-    const cvFlag = n(ex.flagVisible), aisFlag = n(unit.flag);
-    if (cvFlag && cvFlag !== "NONE" && aisFlag && cvFlag.slice(0, 3) !== aisFlag.slice(0, 3))
+    const cvFlag = n(ex.flagVisible), aisFlag = n(ship.flag);
+    if (cvFlag && cvFlag !== "NONE" && cvFlag !== "—" && aisFlag &&
+        !cvFlag.includes(aisFlag.slice(0,3)) && !aisFlag.includes(cvFlag.slice(0,3)))
       diffs.push({ field: "FLAG", cv: cvFlag, ais: aisFlag });
     return { match: diffs.length === 0, diffs };
   };
 
   const runAnalysis = async () => {
     if (!imageBase64 || !apiKey) return;
-    const target = findTarget();
-    setAisTarget(target);
+    const nearAIS = findNearestAIS();
+    const nearDeployed = findNearestDeployed();
+    setAisTarget(nearAIS);
+    setDeployedTarget(nearDeployed);
     setAnalyzing(true); setError(null);
 
-    const prompt = `You are a maritime ISR analyst. Identify vessel characteristics from this aerial image.
-Respond ONLY with a valid JSON object — no markdown, no preamble, no explanation:
+    const prompt = `You are a maritime ISR analyst reviewing aerial imagery.
+Respond ONLY with a valid JSON object — no markdown, no preamble:
 {
-  "vesselType": "TANKER|CARGO|BULK|CONTAINER|MILITARY|FISHING|FERRY|TUGBOAT|UNKNOWN",
+  "vesselType": "TANKER|CARGO|BULK|CONTAINER|MILITARY|FISHING|PASSENGER|TUG|UNKNOWN",
   "estimatedLengthM": <integer or null>,
   "hullColor": "<primary color>",
   "superstructure": "<one sentence>",
-  "flagVisible": "<country name or NONE>",
-  "visibleIdentifiers": "<hull numbers, name, markings, or NONE>",
+  "flagVisible": "<country code e.g. KOR, PAN, USA, or NONE>",
+  "visibleIdentifiers": "<hull numbers, name text, markings, or NONE>",
   "confidence": <0-100>,
   "notes": "<anomalies or observations, max 80 chars>"
 }`;
@@ -1422,20 +1633,15 @@ Respond ONLY with a valid JSON object — no markdown, no preamble, no explanati
     try {
       const res = await fetch("https://api.openai.com/v1/chat/completions", {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${apiKey}`,
-        },
+        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${apiKey}` },
         body: JSON.stringify({
           model: "gpt-4o",
           max_tokens: 400,
           messages: [{
             role: "user",
             content: [
-              {
-                type: "image_url",
-                image_url: { url: `data:${imageMime};base64,${imageBase64}`, detail: "low" },
-              },
+              { type: "image_url",
+                image_url: { url: `data:${imageMime};base64,${imageBase64}`, detail: "low" } },
               { type: "text", text: prompt },
             ],
           }],
@@ -1448,21 +1654,29 @@ Respond ONLY with a valid JSON object — no markdown, no preamble, no explanati
       }
 
       const data = await res.json();
-      const raw  = data.choices[0].message.content.trim().replace(/```json|```/g, "").trim();
-      const ex   = JSON.parse(raw);
+      const raw = data.choices[0].message.content.trim().replace(/```json|```/g, "").trim();
+      const ex = JSON.parse(raw);
       setExtraction(ex);
 
-      const comp = compareWithAIS(ex, target);
-      setComparison(comp);
-
-      if (!comp.match && target) {
-        dispatch({
-          type: "ADD_ALERT",
-          kind: "AIS.MISMATCH",
-          severity: "high",
-          title: `AIS MISMATCH — ${target.label}`,
-          body: `CV: ${ex.vesselType} | AIS: ${target.vesselType}. ${comp.diffs.length} field${comp.diffs.length > 1 ? "s" : ""} discrepant.`,
-        });
+      // ── Comparison logic ──────────────────────────────────────────────────
+      if (nearAIS) {
+        // Case 1: Real AIS ship nearby — compare CV vs AIS
+        const comp = compareWithRealAIS(ex, nearAIS);
+        setComparison({ mode: "ais", ...comp, ship: nearAIS });
+        if (!comp.match) {
+          dispatch({ type: "ADD_ALERT", kind: "AIS.MISMATCH", severity: "high",
+            title: `AIS MISMATCH — ${nearAIS.name || nearAIS.mmsi}`,
+            body: `CV: ${ex.vesselType} vs AIS: ${nearAIS.type}. ${comp.diffs.length} field(s) discrepant.` });
+        }
+      } else if (nearDeployed) {
+        // Case 2: Deployed merchant in sensor range, no real AIS signal → AIS DARK
+        setComparison({ mode: "dark", match: false, diffs: [], vessel: nearDeployed });
+        dispatch({ type: "ADD_ALERT", kind: "AIS.DARK", severity: "high",
+          title: `AIS DARK — ${nearDeployed.label}`,
+          body: "Vessel confirmed by ISR but transmitting no AIS. Possible transponder blackout." });
+      } else {
+        // Case 3: Nothing to compare against
+        setComparison({ mode: "none", match: true, diffs: [] });
       }
     } catch (e) {
       setError(e.message);
@@ -1476,170 +1690,154 @@ Respond ONLY with a valid JSON object — no markdown, no preamble, no explanati
     setExtraction(null); setComparison(null); setError(null);
   };
 
-  // ── STATE: NO KEY ───────────────────────────────────────────────────────────
+  // ── No key ──────────────────────────────────────────────────────────────────
   if (!apiKey) {
     return (
-      <div className="h-full flex flex-col justify-center gap-2 p-3">
-        <div className="text-[9px] tracking-widest mb-1" style={{ color: COLORS.phosphorDim }}>
+      <div style={{ height: "100%", display: "flex", flexDirection: "column",
+                    justifyContent: "center", gap: 8, padding: 12, boxSizing: "border-box" }}>
+        <div style={{ fontSize: 9, letterSpacing: "0.1em", marginBottom: 4, color: COLORS.phosphorDim }}>
           OPENAI API KEY REQUIRED
         </div>
-        <input
-          type="password" placeholder="sk-..."
+        <input type="password" placeholder="sk-..."
           value={keyDraft} onChange={(e) => setKeyDraft(e.target.value)}
           onKeyDown={(e) => e.key === "Enter" && keyDraft.startsWith("sk-") && setApiKey(keyDraft)}
-          className="w-full px-2 py-1.5 text-[10px] font-mono border"
-          style={{
-            background: COLORS.bg, borderColor: COLORS.borderHi,
-            color: COLORS.phosphor, outline: "none",
-          }}
-        />
-        <button
-          onClick={() => keyDraft.startsWith("sk-") && setApiKey(keyDraft)}
+          style={{ width: "100%", padding: "6px 8px", fontSize: 10, boxSizing: "border-box",
+                   border: `1px solid ${COLORS.borderHi}`, background: COLORS.bg,
+                   color: COLORS.phosphor, outline: "none",
+                   fontFamily: "'JetBrains Mono', monospace" }} />
+        <button onClick={() => keyDraft.startsWith("sk-") && setApiKey(keyDraft)}
           disabled={!keyDraft.startsWith("sk-")}
-          className="w-full py-1.5 text-[10px] font-mono font-bold tracking-widest border"
           style={{
-            borderColor: keyDraft.startsWith("sk-") ? COLORS.phosphor : COLORS.border,
+            width: "100%", padding: "6px 0", fontSize: 10, fontWeight: 700,
+            letterSpacing: "0.1em", cursor: keyDraft.startsWith("sk-") ? "pointer" : "not-allowed",
+            border: `1px solid ${keyDraft.startsWith("sk-") ? COLORS.phosphor : COLORS.border}`,
             background: keyDraft.startsWith("sk-") ? COLORS.phosphor : "transparent",
             color: keyDraft.startsWith("sk-") ? COLORS.bg : COLORS.textDim,
-          }}
-        >
+            fontFamily: "'JetBrains Mono', monospace",
+          }}>
           CONNECT GPT-4o
         </button>
-        <div className="text-[8px] font-mono leading-tight" style={{ color: COLORS.textDim }}>
-          // Lives in browser memory only.<br />
-          // Sent only to api.openai.com.
+        <div style={{ fontSize: 8, lineHeight: 1.5, color: COLORS.textDim,
+                      fontFamily: "'JetBrains Mono', monospace" }}>
+          // Lives in browser memory only.<br />// Sent only to api.openai.com.
         </div>
       </div>
     );
   }
 
-  // ── STATE: ANALYZING ────────────────────────────────────────────────────────
+  // ── Analyzing ───────────────────────────────────────────────────────────────
   if (analyzing) {
     return (
-      <div className="h-full flex flex-col items-center justify-center gap-3 p-3">
-        <div className="text-[9px] font-mono tracking-widest animate-pulse"
-             style={{ color: COLORS.amber }}>
-          ▶ GPT-4o ANALYZING...
-        </div>
-        <div className="w-full h-1 border overflow-hidden" style={{ borderColor: COLORS.border }}>
-          <div style={{
-            height: "100%", background: COLORS.phosphor,
-            animation: "cvprogress 1.8s ease-in-out infinite",
-          }} />
+      <div style={{ height: "100%", display: "flex", flexDirection: "column",
+                    alignItems: "center", justifyContent: "center", gap: 12, padding: 12, boxSizing: "border-box" }}>
+        <div style={{ fontSize: 9, fontFamily: "'JetBrains Mono', monospace",
+                      letterSpacing: "0.1em", color: COLORS.amber }}>▶ GPT-4o ANALYZING...</div>
+        <div style={{ width: "100%", height: 4, border: `1px solid ${COLORS.border}`, overflow: "hidden" }}>
+          <div style={{ height: "100%", background: COLORS.phosphor,
+                        animation: "cvprogress 1.8s ease-in-out infinite" }} />
         </div>
         {imageDataUrl && (
-          <img src={imageDataUrl} alt="feed" className="w-full object-cover border"
-               style={{ maxHeight: 80, borderColor: COLORS.border,
+          <img src={imageDataUrl} alt="feed"
+               style={{ width: "100%", maxHeight: 80, objectFit: "cover",
+                        border: `1px solid ${COLORS.border}`,
                         opacity: 0.7, filter: "grayscale(40%) brightness(0.8)" }} />
         )}
-        <div className="text-[8px] font-mono" style={{ color: COLORS.textDim }}>
+        <div style={{ fontSize: 8, color: COLORS.textDim, fontFamily: "'JetBrains Mono', monospace" }}>
           model: gpt-4o · detail: low
         </div>
-        <style>{`
-          @keyframes cvprogress {
-            0%   { width: 0%;   margin-left: 0% }
-            50%  { width: 50%;  margin-left: 25% }
-            100% { width: 0%;   margin-left: 100% }
-          }
-        `}</style>
+        <style>{`@keyframes cvprogress {
+          0%   { width:0%;  margin-left:0% }
+          50%  { width:50%; margin-left:25% }
+          100% { width:0%;  margin-left:100% }
+        }`}</style>
       </div>
     );
   }
 
-  // ── STATE: RESULTS ──────────────────────────────────────────────────────────
-  if (extraction) {
-    const isMatch = comparison?.match ?? true;
-    const diffs   = comparison?.diffs ?? [];
+  // ── Results ─────────────────────────────────────────────────────────────────
+  if (extraction && comparison) {
+    const isDark    = comparison.mode === "dark";
+    const isNone    = comparison.mode === "none";
+    const isMatch   = comparison.match && !isDark;
+    const diffs     = comparison.diffs ?? [];
+    const refShip   = comparison.ship;   // real AIS ship
+    const refDeploy = comparison.vessel; // deployed merchant
 
-    const rowBg = (field) =>
-      diffs.some((d) => d.field === field)
-        ? `${COLORS.hostile}18`
-        : "transparent";
+    const verdictColor = isDark ? COLORS.hostile :
+                         isNone ? COLORS.textDim :
+                         isMatch ? COLORS.phosphor : COLORS.hostile;
 
     const rows = [
-      { f: "TYPE", cv: extraction.vesselType,
-        ais: aisTarget?.vesselType || "—" },
-      { f: "FLAG", cv: extraction.flagVisible || "—",
-        ais: aisTarget?.flag || "—" },
-      { f: "LEN",  cv: extraction.estimatedLengthM ? `~${extraction.estimatedLengthM}m` : "—",
+      { f: "TYPE",  cv: extraction.vesselType,
+        ais: refShip?.type || refDeploy?.vesselType || "—" },
+      { f: "FLAG",  cv: extraction.flagVisible || "—",
+        ais: refShip?.flag || refDeploy?.flag || "—" },
+      { f: "LEN",   cv: extraction.estimatedLengthM ? `~${extraction.estimatedLengthM}m` : "—",
         ais: "—" },
-      { f: "HULL", cv: extraction.hullColor || "—",
-        ais: "—" },
-      { f: "ID",   cv: extraction.visibleIdentifiers || "—",
-        ais: aisTarget?.mmsi?.slice(0,7) + "…" || "—" },
+      { f: "NAME",  cv: extraction.visibleIdentifiers?.slice(0,10) || "—",
+        ais: refShip?.name?.slice(0,10) || refDeploy?.label || "—" },
+      { f: "MMSI",  cv: "—",
+        ais: refShip?.mmsi || refDeploy?.mmsi?.slice(0,9) || "NO DATA" },
     ];
 
     return (
-      <div className="h-full flex flex-col gap-1.5 p-2 overflow-y-auto"
-           style={{ scrollbarWidth: "thin" }}>
-
-        {/* Thumbnail + confidence */}
-        <div className="flex gap-2 items-start">
+      <div style={{ height: "100%", display: "flex", flexDirection: "column", gap: 6, padding: 8, overflowY: "auto", boxSizing: "border-box" }}>
+        <div style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
           {imageDataUrl && (
-            <img src={imageDataUrl} alt="target" className="object-cover border flex-shrink-0"
-                 style={{ width: 64, height: 48, borderColor: isMatch ? COLORS.border : COLORS.hostile }} />
+            <img src={imageDataUrl} alt="target" style={{ width: 64, height: 48, objectFit: "cover", flexShrink: 0, border: `1px solid ${verdictColor}` }} />
           )}
-          <div className="flex-1 text-[8.5px] font-mono" style={{ color: COLORS.textDim }}>
+          <div style={{ flex: 1, fontSize: 8.5, fontFamily: "'JetBrains Mono', monospace", color: COLORS.textDim }}>
             <div style={{ color: COLORS.phosphor }}>GPT-4o EXTRACT</div>
             <div>CONF: <span style={{ color: COLORS.amber }}>{extraction.confidence}%</span></div>
-            {aisTarget && (
-              <div style={{ color: COLORS.amberDim }}>
-                AIS: {aisTarget.label}
-              </div>
-            )}
+            <div style={{ color: isDark ? COLORS.hostile : COLORS.amberDim }}>
+              {isDark ? "⚠ NO AIS SIGNAL" :
+               refShip ? `AIS: ${refShip.name?.slice(0,12) || refShip.mmsi}` :
+               isNone ? "NO AIS CONTACT" : "—"}
+            </div>
           </div>
         </div>
 
-        {/* Comparison table */}
         <div style={{ fontSize: "8.5px", fontFamily: "'JetBrains Mono', monospace" }}>
-          <div className="grid grid-cols-3 border-b pb-0.5 mb-0.5"
-               style={{ borderColor: COLORS.border }}>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", borderBottom: `1px solid ${COLORS.border}`, paddingBottom: 2, marginBottom: 2 }}>
             <span style={{ color: COLORS.textDim }}>FIELD</span>
             <span style={{ color: COLORS.neutral }}>CV</span>
-            <span style={{ color: COLORS.amber }}>AIS</span>
+            <span style={{ color: isDark ? COLORS.hostile : COLORS.amber }}>
+              {isDark ? "AIS ✗" : "AIS"}
+            </span>
           </div>
           {rows.map(({ f, cv, ais }) => {
-            const mismatch = diffs.some((d) => d.field === f);
-            const trunc = (s) => s?.length > 9 ? s.slice(0, 9) + "…" : (s || "—");
+            const mismatch = diffs.some((d) => d.field === f) || (isDark && f === "MMSI");
+            const trunc = (s) => s?.length > 10 ? s.slice(0, 10) + "…" : (s || "—");
             return (
-              <div key={f} className="grid grid-cols-3 py-0.5"
-                   style={{ background: rowBg(f) }}>
+              <div key={f} style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", padding: "2px 0", background: mismatch ? `${COLORS.hostile}18` : "transparent" }}>
                 <span style={{ color: COLORS.textDim }}>{f}</span>
-                <span style={{ color: mismatch ? COLORS.hostile : COLORS.neutral }}>
-                  {trunc(cv)}
-                </span>
-                <span style={{ color: mismatch ? COLORS.hostile : COLORS.amber }}>
-                  {trunc(ais)}
-                </span>
+                <span style={{ color: mismatch ? COLORS.hostile : COLORS.neutral }}>{trunc(cv)}</span>
+                <span style={{ color: mismatch ? COLORS.hostile : COLORS.amber }}>{trunc(ais)}</span>
               </div>
             );
           })}
         </div>
 
-        {/* Notes */}
         {extraction.notes && extraction.notes !== "None" && (
           <div className="text-[7.5px] font-mono px-1 py-0.5 border"
                style={{ borderColor: COLORS.border, color: COLORS.textDim }}>
-            {extraction.notes.length > 70
-              ? extraction.notes.slice(0, 70) + "…"
-              : extraction.notes}
+            {extraction.notes.slice(0, 80)}
           </div>
         )}
 
-        {/* Verdict banner */}
         <div className="border px-2 py-1.5 text-[9px] font-mono font-bold"
              style={{
-               borderColor: isMatch ? COLORS.phosphor : COLORS.hostile,
-               background: isMatch ? `${COLORS.phosphor}0d` : `${COLORS.hostile}0d`,
-               color: isMatch ? COLORS.phosphor : COLORS.hostile,
+               borderColor: verdictColor,
+               background: `${verdictColor}0d`,
+               color: verdictColor,
                letterSpacing: "0.1em",
              }}>
-          {isMatch
-            ? "✓ AIS CONSISTENT"
-            : `⚠ MISMATCH · ${diffs.length} FIELD${diffs.length > 1 ? "S" : ""}`}
+          {isDark  ? "⚠ AIS DARK — NO TRANSPONDER" :
+           isNone  ? "// NO AIS CONTACT IN RANGE" :
+           isMatch ? "✓ AIS CONSISTENT" :
+                     `⚠ MISMATCH · ${diffs.length} FIELD${diffs.length > 1 ? "S" : ""}`}
         </div>
 
-        {/* Error */}
         {error && (
           <div className="text-[8px] font-mono p-1 border"
                style={{ borderColor: COLORS.hostile, color: COLORS.hostile }}>
@@ -1647,16 +1845,13 @@ Respond ONLY with a valid JSON object — no markdown, no preamble, no explanati
           </div>
         )}
 
-        {/* Actions */}
-        <div className="flex gap-1">
+        <div style={{ display: "flex", gap: 4 }}>
           <button onClick={reset}
-            className="flex-1 py-1 border text-[9px] font-mono"
-            style={{ borderColor: COLORS.border, color: COLORS.textDim }}>
+            style={{ flex: 1, padding: "4px 0", border: `1px solid ${COLORS.border}`, fontSize: 9, color: COLORS.textDim, background: "transparent", cursor: "pointer", fontFamily: "'JetBrains Mono', monospace" }}>
             NEW IMG
           </button>
           <button onClick={runAnalysis}
-            className="flex-1 py-1 border text-[9px] font-mono font-bold"
-            style={{ borderColor: COLORS.phosphor, color: COLORS.phosphor }}>
+            style={{ flex: 1, padding: "4px 0", border: `1px solid ${COLORS.phosphor}`, fontSize: 9, fontWeight: 700, color: COLORS.phosphor, background: "transparent", cursor: "pointer", fontFamily: "'JetBrains Mono', monospace" }}>
             RERUN
           </button>
           <button onClick={() => { setApiKey(""); setKeyDraft(""); reset(); }}
@@ -1669,20 +1864,19 @@ Respond ONLY with a valid JSON object — no markdown, no preamble, no explanati
     );
   }
 
-  // ── STATE: DROP ZONE (key set, no results) ──────────────────────────────────
-  const curTarget = findTarget();
+  // ── Drop zone ───────────────────────────────────────────────────────────────
+  const nearAIS      = findNearestAIS();
+  const nearDeployed = findNearestDeployed();
+
   return (
-    <div className="h-full flex flex-col gap-2 p-2">
-      {/* Status row */}
-      <div className="flex items-center justify-between text-[9px] font-mono">
-        <div className="flex items-center gap-1.5" style={{ color: COLORS.phosphorDim }}>
+    <div style={{ height: "100%", display: "flex", flexDirection: "column", gap: 8, padding: 8, boxSizing: "border-box" }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", fontSize: 9, fontFamily: "'JetBrains Mono', monospace", flexShrink: 0 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 6, color: COLORS.phosphorDim }}>
           <Camera size={9} />
           {activeUAV
             ? <><span>UAV-{activeUAV.label}</span>
-                <span className="flex items-center gap-0.5" style={{ color: COLORS.hostile }}>
-                  <span className="w-1 h-1 rounded-full animate-pulse inline-block"
-                        style={{ background: COLORS.hostile }} />
-                  LIVE
+                <span style={{ display: "inline-flex", alignItems: "center", gap: 3, marginLeft: 4, color: COLORS.hostile }}>
+                  <span style={{ width: 6, height: 6, borderRadius: "50%", background: COLORS.hostile, display: "inline-block" }} />LIVE
                 </span></>
             : jammedUAV
               ? <span style={{ color: COLORS.amber }}>JAMMED</span>
@@ -1690,31 +1884,33 @@ Respond ONLY with a valid JSON object — no markdown, no preamble, no explanati
           }
         </div>
         <button onClick={() => { setApiKey(""); setKeyDraft(""); }}
-          className="text-[8px] font-mono"
-          style={{ color: COLORS.phosphorDim }}>
+          style={{ fontSize: 8, color: COLORS.phosphorDim, background: "none", border: "none", cursor: "pointer", fontFamily: "inherit" }}>
           GPT-4o ✓
         </button>
       </div>
 
-      {/* AIS target info */}
-      <div className="border px-2 py-1 text-[8px] font-mono"
-           style={{
-             borderColor: curTarget ? COLORS.amber : COLORS.border,
-             background: curTarget ? `${COLORS.amber}08` : "transparent",
-           }}>
-        {curTarget
-          ? <>
-              <span style={{ color: COLORS.amberDim }}>AIS TARGET · </span>
-              <span style={{ color: COLORS.amber }}>{curTarget.label}</span>
-              <span style={{ color: COLORS.textDim }}> · {curTarget.vesselType} · {curTarget.flag}</span>
-            </>
-          : <span style={{ color: COLORS.textDim }}>// No confirmed AIS contact in sensor range.</span>
+      {/* Context: what ISR sees */}
+      <div className="border px-2 py-1 text-[8px] font-mono space-y-0.5"
+           style={{ borderColor: nearAIS ? COLORS.ais : nearDeployed ? COLORS.amber : COLORS.border }}>
+        {nearAIS
+          ? <div>
+              <span style={{ color: COLORS.aisDim }}>AIS · </span>
+              <span style={{ color: COLORS.ais }}>{nearAIS.name?.slice(0,14) || nearAIS.mmsi}</span>
+              <span style={{ color: COLORS.textDim }}> · {nearAIS.type} · {nearAIS.flag}</span>
+            </div>
+          : <div style={{ color: COLORS.textDim }}>// No real AIS contact in sensor range</div>
         }
+        {nearDeployed && (
+          <div>
+            <span style={{ color: COLORS.amberDim }}>SIM · </span>
+            <span style={{ color: COLORS.amber }}>{nearDeployed.label}</span>
+            <span style={{ color: COLORS.textDim }}> {nearDeployed.vesselType} (no AIS)</span>
+          </div>
+        )}
       </div>
 
-      {/* Drop zone */}
       <div
-        className="flex-1 flex flex-col items-center justify-center border cursor-pointer"
+        style={{ flex: "1 1 0", minHeight: 0, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", border: "1px dashed", cursor: "pointer", overflow: "hidden" }}
         style={{
           borderColor: isDragOver ? COLORS.phosphor : COLORS.borderHi,
           borderStyle: "dashed",
@@ -1727,9 +1923,7 @@ Respond ONLY with a valid JSON object — no markdown, no preamble, no explanati
         onClick={() => fileInputRef.current?.click()}
       >
         {imageDataUrl
-          ? <img src={imageDataUrl} alt="target"
-                 className="w-full h-full object-cover"
-                 style={{ opacity: 0.9 }} />
+          ? <img src={imageDataUrl} alt="target" style={{ width: "100%", height: "100%", objectFit: "cover", opacity: 0.9 }} />
           : <div className="text-center px-2">
               <ImageIcon size={18} style={{ color: COLORS.phosphorDim, margin: "0 auto 4px" }} />
               <div className="text-[9px] font-mono" style={{ color: COLORS.textDim }}>
@@ -1743,15 +1937,9 @@ Respond ONLY with a valid JSON object — no markdown, no preamble, no explanati
                onChange={(e) => e.target.files[0] && readFile(e.target.files[0])} />
       </div>
 
-      {/* Analyze button — only shown once image is loaded */}
       {imageDataUrl && (
         <button onClick={runAnalysis}
-          className="w-full py-1.5 border text-[10px] font-mono font-bold tracking-widest"
-          style={{
-            borderColor: COLORS.phosphor,
-            background: COLORS.phosphor,
-            color: COLORS.bg,
-          }}>
+          style={{ width: "100%", padding: "6px 0", flexShrink: 0, border: `1px solid ${COLORS.phosphor}`, background: COLORS.phosphor, color: COLORS.bg, fontSize: 10, fontWeight: 700, letterSpacing: "0.1em", cursor: "pointer", fontFamily: "'JetBrains Mono', monospace" }}>
           ▶ ANALYZE WITH GPT-4o
         </button>
       )}
@@ -1765,29 +1953,29 @@ Respond ONLY with a valid JSON object — no markdown, no preamble, no explanati
     </div>
   );
 };
-
 // ─── PANEL: COMMAND ──────────────────────────────────────────────────────────
 const CmdButton = ({ icon, label, active, disabled, onClick }) => (
   <button onClick={onClick} disabled={disabled}
-    className="px-1.5 py-2 border transition-colors flex flex-col items-center gap-1"
     style={{
-      borderColor: active ? COLORS.phosphor : COLORS.border,
+      padding: "8px 6px", border: `1px solid ${active ? COLORS.phosphor : COLORS.border}`,
       background: active ? "rgba(184,255,94,0.08)" : "transparent",
       color: disabled ? COLORS.textDim : (active ? COLORS.phosphor : COLORS.text),
       opacity: disabled ? 0.4 : 1, cursor: disabled ? "not-allowed" : "pointer",
+      display: "flex", flexDirection: "column", alignItems: "center", gap: 4,
+      fontFamily: "'JetBrains Mono', monospace",
     }}>
     {icon}
-    <span className="text-[9px] font-mono tracking-wider font-bold">{label}</span>
+    <span style={{ fontSize: 9, fontWeight: 700, letterSpacing: "0.1em" }}>{label}</span>
   </button>
 );
 
 const DeployButton = ({ label, color, active, onClick }) => (
   <button onClick={onClick}
-    className="px-1.5 py-1.5 border text-[9px] font-mono font-bold tracking-wider"
     style={{
-      borderColor: active ? color : COLORS.border,
-      color: color,
-      background: active ? `${color}14` : "transparent",
+      padding: "6px", border: `1px solid ${active ? color : COLORS.border}`,
+      color, background: active ? `${color}14` : "transparent",
+      fontSize: 9, fontWeight: 700, letterSpacing: "0.05em",
+      cursor: "pointer", fontFamily: "'JetBrains Mono', monospace",
     }}>{label}</button>
 );
 
@@ -1796,13 +1984,16 @@ const CommandPanel = ({ state, dispatch, tool, setTool, deployType, setDeployTyp
   const setDeploy = (t) => { setTool("deploy"); setDeployType(t); };
 
   return (
-    <div className="h-full flex">
-      <div className="p-2 flex flex-col gap-1.5"
-           style={{ width: 320, borderRight: `1px solid ${COLORS.border}` }}>
-        <div className="text-[9px] tracking-widest" style={{ color: COLORS.textDim }}>
+    <div style={{ height: "100%", display: "flex" }}>
+      {/* Orders + deploy column */}
+      <div style={{
+        width: 320, padding: 8, display: "flex", flexDirection: "column", gap: 6,
+        borderRight: `1px solid ${COLORS.border}`, flexShrink: 0,
+      }}>
+        <div style={{ fontSize: 9, letterSpacing: "0.1em", color: COLORS.textDim }}>
           ORDERS {!hasSelection && <span style={{ color: COLORS.amberDim }}>// no selection</span>}
         </div>
-        <div className="grid grid-cols-3 gap-1">
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 4 }}>
           <CmdButton icon={<Crosshair size={11} />} label="MOVE"
             disabled={!hasSelection} active={tool === "select"}
             onClick={() => setTool("select")} />
@@ -1814,57 +2005,51 @@ const CommandPanel = ({ state, dispatch, tool, setTool, deployType, setDeployTyp
             onClick={() => dispatch({ type: "HOLD_SELECTED" })} />
         </div>
 
-        <div className="mt-1 text-[9px] tracking-widest" style={{ color: COLORS.textDim }}>
+        <div style={{ fontSize: 9, letterSpacing: "0.1em", color: COLORS.textDim, marginTop: 4 }}>
           DEPLOY <span style={{ color: COLORS.amberDim }}>// sandbox</span>
         </div>
-        <div className="grid grid-cols-3 gap-1">
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 4 }}>
           <DeployButton label="+ ISR" color={COLORS.phosphor}
-            active={tool === "deploy" && deployType === "ISR"}
-            onClick={() => setDeploy("ISR")} />
+            active={tool === "deploy" && deployType === "ISR"} onClick={() => setDeploy("ISR")} />
           <DeployButton label="+ MERCHANT" color={COLORS.neutral}
-            active={tool === "deploy" && deployType === "COMMERCIAL"}
-            onClick={() => setDeploy("COMMERCIAL")} />
+            active={tool === "deploy" && deployType === "COMMERCIAL"} onClick={() => setDeploy("COMMERCIAL")} />
           <DeployButton label="+ HOSTILE" color={COLORS.hostile}
-            active={tool === "deploy" && deployType === "ENEMY"}
-            onClick={() => setDeploy("ENEMY")} />
+            active={tool === "deploy" && deployType === "ENEMY"} onClick={() => setDeploy("ENEMY")} />
           <DeployButton label="+ SUB" color={COLORS.subsurface}
-            active={tool === "deploy" && deployType === "SUBMARINE"}
-            onClick={() => setDeploy("SUBMARINE")} />
+            active={tool === "deploy" && deployType === "SUBMARINE"} onClick={() => setDeploy("SUBMARINE")} />
           <DeployButton label="+ MINE" color={COLORS.subsurface}
-            active={tool === "deploy" && deployType === "MINE"}
-            onClick={() => setDeploy("MINE")} />
+            active={tool === "deploy" && deployType === "MINE"} onClick={() => setDeploy("MINE")} />
           <DeployButton label="+ JAM" color={COLORS.amber}
-            active={tool === "deploy" && deployType === "JAM"}
-            onClick={() => setDeploy("JAM")} />
+            active={tool === "deploy" && deployType === "JAM"} onClick={() => setDeploy("JAM")} />
         </div>
 
-        <div className="mt-auto text-[9px] font-mono leading-snug" style={{ color: COLORS.textDim }}>
+        <div style={{ marginTop: "auto", fontSize: 9, lineHeight: 1.6, color: COLORS.textDim,
+                      fontFamily: "'JetBrains Mono', monospace" }}>
           {tool === "patrol" ? (
-            <>
-              <span style={{ color: COLORS.phosphor }}>{">"}</span> Click vertices · R-click to close
-            </>
+            <><span style={{ color: COLORS.phosphor }}>{">"}</span> Click vertices · R-click to close</>
           ) : tool === "deploy" ? (
-            <>
-              <span style={{ color: COLORS.amber }}>{">"}</span> Click map to place {deployType.toLowerCase()}
-              {deployType === "JAM" && <><br /><span style={{ color: COLORS.amber }}>{">"}</span> Shift+click zone to remove</>}
-            </>
+            <><span style={{ color: COLORS.amber }}>{">"}</span> Click map to place {deployType.toLowerCase()}</>
           ) : (
             <>
               <span style={{ color: COLORS.phosphor }}>{">"}</span> R-click water: move<br />
               <span style={{ color: COLORS.phosphor }}>{">"}</span> R-click contact: TRACK<br />
-              <span style={{ color: COLORS.phosphor }}>{">"}</span> Drag: box-select · Edge: pan
+              <span style={{ color: COLORS.phosphor }}>{">"}</span> Drag-select · Edge: pan
             </>
           )}
         </div>
       </div>
 
-      <div className="flex-1 flex flex-col">
-        <div className="px-2 pt-2 pb-1 text-[9px] tracking-widest" style={{ color: COLORS.amberDim }}>
+      {/* Alert feed column */}
+      <div style={{ flex: "1 1 0", minWidth: 0, display: "flex", flexDirection: "column" }}>
+        <div style={{ padding: "8px 8px 4px", fontSize: 9, letterSpacing: "0.1em",
+                      color: COLORS.amberDim, flexShrink: 0 }}>
           ALERT.FEED
         </div>
-        <div className="flex-1 overflow-y-auto px-2 space-y-1 pb-2" style={{ scrollbarWidth: "thin" }}>
+        <div style={{ flex: "1 1 0", overflowY: "auto", padding: "0 8px 8px",
+                      display: "flex", flexDirection: "column", gap: 4, minHeight: 0 }}>
           {state.alerts.length === 0 && (
-            <div className="text-[10px] font-mono px-1" style={{ color: COLORS.textDim }}>
+            <div style={{ fontSize: 10, color: COLORS.textDim,
+                          fontFamily: "'JetBrains Mono', monospace" }}>
               // No active alerts. Sensors nominal.
             </div>
           )}
@@ -1872,17 +2057,20 @@ const CommandPanel = ({ state, dispatch, tool, setTool, deployType, setDeployTyp
             const sevColor = a.severity === "high" ? COLORS.hostile :
                              a.severity === "med" ? COLORS.amber : COLORS.phosphor;
             return (
-              <div key={a.id} className="border p-1.5 cursor-pointer"
-                style={{ borderColor: sevColor, background: `${sevColor}0d` }}
+              <div key={a.id}
+                style={{ border: `1px solid ${sevColor}`, padding: "6px 8px",
+                         background: `${sevColor}0d`, cursor: "pointer", flexShrink: 0 }}
                 onClick={() => dispatch({ type: "DISMISS_ALERT", id: a.id })}>
-                <div className="flex items-center gap-1 text-[9px] font-mono" style={{ color: sevColor }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 9,
+                              color: sevColor, fontFamily: "'JetBrains Mono', monospace" }}>
                   <AlertTriangle size={9} />
-                  <span className="font-bold tracking-wider">{a.kind}</span>
-                  <span className="ml-auto" style={{ color: COLORS.textDim }}>
+                  <span style={{ fontWeight: 700, letterSpacing: "0.1em" }}>{a.kind}</span>
+                  <span style={{ marginLeft: "auto", color: COLORS.textDim }}>
                     T+{Math.floor(a.time)}s
                   </span>
                 </div>
-                <div className="text-[10px] font-mono mt-0.5" style={{ color: COLORS.text }}>
+                <div style={{ fontSize: 10, marginTop: 2, color: COLORS.text,
+                              fontFamily: "'JetBrains Mono', monospace" }}>
                   {a.title}
                 </div>
               </div>
@@ -1907,10 +2095,15 @@ const CursorStrip = ({ cursorWorld, state }) => {
   ).length;
 
   return (
-    <div className="h-6 flex items-center justify-between px-3 border-t font-mono text-[10px] shrink-0"
-         style={{ background: COLORS.bg, borderColor: COLORS.border, color: COLORS.textDim }}>
-      <div className="flex items-center gap-3">
-        <span>CRSR: <span style={{ color: COLORS.phosphor }} className="tabular-nums">
+    <div style={{
+      height: 24, display: "flex", alignItems: "center", justifyContent: "space-between",
+      padding: "0 12px", flexShrink: 0,
+      borderTop: `1px solid ${COLORS.border}`,
+      background: COLORS.bg, color: COLORS.textDim,
+      fontFamily: "'JetBrains Mono', monospace", fontSize: 10,
+    }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+        <span>CRSR: <span style={{ color: COLORS.phosphor }}>
           {cursorWorld ? `${cursorWorld.x.toFixed(0)}, ${cursorWorld.y.toFixed(0)}` : "----, ----"}
         </span></span>
         <span>SEL: <span style={{ color: COLORS.phosphor }}>{state.selectedIds.length}</span></span>
@@ -1923,63 +2116,15 @@ const CursorStrip = ({ cursorWorld, state }) => {
   );
 };
 
-
-
-// ─── LOCAL LAYOUT CSS FALLBACK ───────────────────────────────────────────────
-// Keeps the artifact full-screen and horizontally aligned even when Tailwind
-// is not installed in the local Node/Vite app.
-const LayoutCSS = () => (
-  <style>{`
-    html, body, #root { width: 100%; height: 100%; margin: 0; overflow: hidden; }
-    * { box-sizing: border-box; }
-    button { font: inherit; }
-    .relative { position: relative; } .absolute { position: absolute; } .inset-0 { inset: 0; }
-    .flex { display: flex; } .grid { display: grid; } .grid-cols-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-    .flex-col { flex-direction: column; } .items-center { align-items: center; } .items-start { align-items: flex-start; }
-    .justify-between { justify-content: space-between; } .justify-center { justify-content: center; }
-    .flex-1 { flex: 1 1 0%; min-width: 0; min-height: 0; } .shrink-0 { flex-shrink: 0; } .flex-shrink-0 { flex-shrink: 0; }
-    .w-full { width: 100%; } .h-full { height: 100%; } .w-screen { width: 100vw; } .h-screen { height: 100vh; }
-    .h-1 { height: .25rem; } .h-6 { height: 1.5rem; } .h-7 { height: 1.75rem; } .h-11 { height: 2.75rem; }
-    .w-1 { width: .25rem; } .w-9 { width: 2.25rem; }
-    .min-w-0 { min-width: 0; } .max-h-24 { max-height: 6rem; }
-    .overflow-hidden { overflow: hidden; } .overflow-y-auto { overflow-y: auto; } .object-cover { object-fit: cover; }
-    .select-none { user-select: none; } .pointer-events-none { pointer-events: none; } .cursor-pointer { cursor: pointer; }
-    .border { border: 1px solid currentColor; } .border-t { border-top: 1px solid currentColor; } .border-b { border-bottom: 1px solid currentColor; } .border-r { border-right: 1px solid currentColor; } .border-dashed { border-style: dashed; }
-    .p-1 { padding: .25rem; } .p-1\.5 { padding: .375rem; } .p-2 { padding: .5rem; } .p-3 { padding: .75rem; }
-    .px-1 { padding-left: .25rem; padding-right: .25rem; } .px-1\.5 { padding-left: .375rem; padding-right: .375rem; }
-    .px-2 { padding-left: .5rem; padding-right: .5rem; } .px-2\.5 { padding-left: .625rem; padding-right: .625rem; }
-    .px-3 { padding-left: .75rem; padding-right: .75rem; } .px-4 { padding-left: 1rem; padding-right: 1rem; }
-    .py-0\.5 { padding-top: .125rem; padding-bottom: .125rem; } .py-1 { padding-top: .25rem; padding-bottom: .25rem; } .py-1\.5 { padding-top: .375rem; padding-bottom: .375rem; } .py-2 { padding-top: .5rem; padding-bottom: .5rem; }
-    .pt-2 { padding-top: .5rem; } .pb-0\.5 { padding-bottom: .125rem; } .pb-1 { padding-bottom: .25rem; } .pb-2 { padding-bottom: .5rem; }
-    .mb-0\.5 { margin-bottom: .125rem; } .mb-1 { margin-bottom: .25rem; } .mb-1\.5 { margin-bottom: .375rem; } .mt-0\.5 { margin-top: .125rem; } .mt-1 { margin-top: .25rem; } .mt-auto { margin-top: auto; } .ml-2 { margin-left: .5rem; } .ml-auto { margin-left: auto; }
-    .gap-0\.5 { gap: .125rem; } .gap-1 { gap: .25rem; } .gap-1\.5 { gap: .375rem; } .gap-2 { gap: .5rem; } .gap-3 { gap: .75rem; } .gap-4 { gap: 1rem; }
-    .space-y-1 > * + * { margin-top: .25rem; }
-    .text-left { text-align: left; } .text-center { text-align: center; } .text-xs { font-size: .75rem; line-height: 1rem; } .text-sm { font-size: .875rem; line-height: 1.25rem; }
-    .text-\[7\.5px\] { font-size: 7.5px; } .text-\[8px\] { font-size: 8px; } .text-\[8\.5px\] { font-size: 8.5px; } .text-\[9px\] { font-size: 9px; } .text-\[10px\] { font-size: 10px; }
-    .font-bold { font-weight: 700; } .font-mono { font-family: 'JetBrains Mono', monospace; }
-    .leading-tight { line-height: 1.15; } .leading-snug { line-height: 1.35; }
-    .tracking-wider { letter-spacing: .05em; } .tracking-widest { letter-spacing: .1em; } .tracking-\[0\.2em\] { letter-spacing: .2em; } .tracking-\[0\.25em\] { letter-spacing: .25em; }
-    .tabular-nums { font-variant-numeric: tabular-nums; } .truncate { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .rounded-full { border-radius: 9999px; } .fill-current { fill: currentColor; } .inline-block { display: inline-block; }
-    .transition-colors { transition: color .15s ease, background-color .15s ease, border-color .15s ease; }
-    .animate-pulse { animation: bsw-pulse 1.4s ease-in-out infinite; }
-    @keyframes bsw-pulse { 0%,100% { opacity: 1; } 50% { opacity: .45; } }
-    @media (max-width: 960px) {
-      .bsw-bottom-hud { height: 240px !important; overflow-x: auto; }
-      .bsw-dock-panel { min-width: 220px; }
-    }
-  `}</style>
-);
-
 const ScanlineOverlay = () => (
-  <div className="pointer-events-none absolute inset-0"
-    style={{
-      backgroundImage: `repeating-linear-gradient(
-        0deg, rgba(0,0,0,0.12) 0px, rgba(0,0,0,0.12) 1px,
-        transparent 1px, transparent 3px
-      )`,
-      mixBlendMode: "multiply", zIndex: 100,
-    }} />
+  <div style={{
+    pointerEvents: "none", position: "absolute", inset: 0, zIndex: 100,
+    backgroundImage: `repeating-linear-gradient(
+      0deg, rgba(0,0,0,0.12) 0px, rgba(0,0,0,0.12) 1px,
+      transparent 1px, transparent 3px
+    )`,
+    mixBlendMode: "multiply",
+  }} />
 );
 
 // ─── MAIN APP ────────────────────────────────────────────────────────────────
@@ -1990,12 +2135,94 @@ export default function App() {
   const [hover, setHover] = useState(null);
   const [cursorWorld, setCursorWorld] = useState(null);
   const [cam, setCam] = useState({ x: 0, y: 0, zoom: 0.55 });
+  const [aisUsername, setAisUsername] = useState("");
+  const [aisStatus, setAisStatus] = useState("disconnected"); // disconnected | fetching | ok | error
+  const aisUsernameRef = useRef(aisUsername);
+  aisUsernameRef.current = aisUsername;
 
   useEffect(() => {
     if (state.paused) return;
     const id = setInterval(() => dispatch({ type: "TICK" }), CONFIG.TICK_MS);
     return () => clearInterval(id);
   }, [state.paused]);
+
+  // AIS fetch — polls AISHub every 60s while username is set
+  const fetchAIS = useCallback(async (username) => {
+    if (!username) return;
+    setAisStatus("fetching");
+    // Centre the fetch box on current ISR-1 position (world → geo)
+    const usv = state.units.find((u) => u.type === "USV");
+    const centre = usv ? worldToGeo(usv.x, usv.y) : { lat: 37, lon: 126 };
+    const pad = CONFIG.AIS_RANGE_DEG;
+    const latMin = (centre.lat - pad).toFixed(2);
+    const latMax = (centre.lat + pad).toFixed(2);
+    const lonMin = (centre.lon - pad).toFixed(2);
+    const lonMax = (centre.lon + pad).toFixed(2);
+    const aisUrl = `https://data.aishub.net/ws.php?username=${username}&format=1&output=json&compress=0&latmin=${latMin}&latmax=${latMax}&lonmin=${lonMin}&lonmax=${lonMax}`;
+    const proxyUrl = `https://corsproxy.io/?${encodeURIComponent(aisUrl)}`;
+    try {
+      const res = await fetch(proxyUrl);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const raw = await res.json();
+      // AISHub format=1 → [ {header}, [ {ship}, … ] ]
+      const shipArr = Array.isArray(raw) && raw.length >= 2 && Array.isArray(raw[1])
+        ? raw[1]
+        : Array.isArray(raw) ? raw : [];
+      const ships = shipArr
+        .filter((s) => s.MMSI && s.LATITUDE && s.LONGITUDE)
+        .map((s) => {
+          const wp = geoToWorld(parseFloat(s.LATITUDE), parseFloat(s.LONGITUDE));
+          return {
+            mmsi:    String(s.MMSI),
+            name:    (s.NAME || "").trim() || `MMSI-${s.MMSI}`,
+            lat:     parseFloat(s.LATITUDE),
+            lon:     parseFloat(s.LONGITUDE),
+            wx:      wp.x,
+            wy:      wp.y,
+            cog:     parseFloat(s.COG) || 0,
+            sog:     parseFloat(s.SOG) || 0,
+            heading: parseFloat(s.HEADING) || parseFloat(s.COG) || 0,
+            type:    decodeAISType(s.TYPE),
+            flag:    s.FLAG || "—",
+            dest:    (s.DEST || "—").trim(),
+            imo:     s.IMO ? String(s.IMO) : null,
+          };
+        });
+      dispatch({ type: "SET_AIS_SHIPS", ships });
+      setAisStatus("ok");
+    } catch (err) {
+      console.warn("AIS fetch failed:", err.message);
+      setAisStatus("error");
+    }
+  }, [state.units]);
+
+  useEffect(() => {
+    if (!aisUsername) { setAisStatus("disconnected"); return; }
+    fetchAIS(aisUsername);
+    const id = setInterval(() => fetchAIS(aisUsernameRef.current), CONFIG.AIS_FETCH_MS);
+    return () => clearInterval(id);
+  }, [aisUsername]);
+
+  // Full-screen CSS reset — ensures html/body/#root fill the viewport in local dev
+  useEffect(() => {
+    const style = document.createElement("style");
+    style.id = "bsw-reset";
+    style.textContent = `
+      *, *::before, *::after { box-sizing: border-box; }
+      html, body {
+        margin: 0; padding: 0;
+        width: 100%; height: 100%;
+        overflow: hidden;
+        background: #08100c;
+      }
+      #root, #app {
+        width: 100%; height: 100%;
+        display: flex; flex-direction: column;
+      }
+    `;
+    document.head.appendChild(style);
+    return () => { try { document.head.removeChild(style); } catch (e) {} };
+  }, []);
 
   useEffect(() => {
     const link = document.createElement("link");
@@ -2017,21 +2244,29 @@ export default function App() {
   }, []);
 
   return (
-    <>
-    <LayoutCSS />
-    <div className="relative h-screen w-screen flex flex-col overflow-hidden"
-      style={{ background: COLORS.bg, color: COLORS.text,
-               fontFamily: "'JetBrains Mono', 'Courier New', monospace", minWidth: 0, minHeight: 0 }}>
-      <TopBar state={state} dispatch={dispatch} />
+    <div style={{
+      position: "fixed", inset: 0,
+      display: "flex", flexDirection: "column", overflow: "hidden",
+      background: COLORS.bg, color: COLORS.text,
+      fontFamily: "'JetBrains Mono', 'Courier New', monospace",
+    }}>
+      <TopBar state={state} dispatch={dispatch}
+              aisUsername={aisUsername} setAisUsername={setAisUsername}
+              aisStatus={aisStatus} onRefreshAIS={() => fetchAIS(aisUsername)} />
 
-      <div className="flex-1 flex relative overflow-hidden">
+      {/* Map — takes all remaining vertical space */}
+      <div style={{ flex: "1 1 0", minHeight: 0, position: "relative", overflow: "hidden" }}>
         <MapView state={state} dispatch={dispatch}
           tool={tool} setTool={setTool} deployType={deployType}
           setHover={setHover} setCursorWorld={setCursorWorld}
           cam={cam} setCam={setCam} />
       </div>
 
-      <div className="bsw-bottom-hud flex shrink-0 border-t" style={{ height: "clamp(210px, 27vh, 260px)", borderColor: COLORS.border, minWidth: 0 }}>
+      {/* Bottom dock — 4 panels side by side, fixed height */}
+      <div style={{
+        height: 224, flexShrink: 0, display: "flex",
+        borderTop: `1px solid ${COLORS.border}`,
+      }}>
         <DockPanel title="TACTICAL.OVERVIEW" width={260}
           icon={<Hexagon size={10} style={{ color: COLORS.phosphor }} />}>
           <TacticalOverviewPanel state={state} cam={cam} setCam={setCam} />
@@ -2055,6 +2290,5 @@ export default function App() {
       <CursorStrip cursorWorld={cursorWorld} state={state} />
       <ScanlineOverlay />
     </div>
-    </>
   );
 }
