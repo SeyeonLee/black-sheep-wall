@@ -2,7 +2,7 @@ import { COLORS, CONFIG } from "../../config";
 import { rad2deg, isUnderwater } from "../../utils";
 
 export const UnitGlyph = ({
-  unit, selected, detected, onClick, onContextMenu, canTrack, isAutoTracked,
+  unit, selected, detected, onClick, onContextMenu, canTrack, isAutoTracked, isEscorted,
 }) => {
   const isFriendly = unit.faction === "friendly";
   const isHostile  = unit.faction === "hostile";
@@ -99,7 +99,7 @@ export const UnitGlyph = ({
   return (
     <g transform={`translate(${unit.x},${unit.y})`}
        style={{ cursor: canTrack ? "crosshair" : "pointer" }}
-       onMouseDown={(e) => { e.stopPropagation(); onClick && onClick(unit, e); }}
+       onMouseDown={(e) => { e.stopPropagation(); if (e.button !== 2) onClick && onClick(unit, e); }}
        onContextMenu={(e) => {
          if (onContextMenu) {
            e.preventDefault(); e.stopPropagation();
@@ -114,6 +114,14 @@ export const UnitGlyph = ({
         <circle r="22" fill="none" stroke={COLORS.amber} strokeWidth="2" opacity="0.85">
           <animate attributeName="r" values="18;28;18" dur="1.4s" repeatCount="indefinite" />
           <animate attributeName="opacity" values="0.85;0.25;0.85" dur="1.4s" repeatCount="indefinite" />
+        </circle>
+      )}
+
+      {/* ── Escorted: pulsing phosphor ring (friendly being followed) ──────── */}
+      {isEscorted && (
+        <circle r="22" fill="none" stroke={COLORS.phosphor} strokeWidth="2" opacity="0.9">
+          <animate attributeName="r" values="18;30;18" dur="1.8s" repeatCount="indefinite" />
+          <animate attributeName="opacity" values="0.9;0.2;0.9" dur="1.8s" repeatCount="indefinite" />
         </circle>
       )}
 
@@ -164,6 +172,14 @@ export const UnitGlyph = ({
            : isNewContact ? "NEW CNTCT"
            : isPossible   ? "POSSIBLE"
            : "CONFIRMED"}
+        </text>
+      )}
+
+      {/* ── ESCORTED label (friendly unit being followed by another USV) ───── */}
+      {isFriendly && isEscorted && (
+        <text x="14" y="0" fontSize="6.5" fontFamily="'JetBrains Mono', monospace"
+              fill={COLORS.phosphor} letterSpacing="0.1em" opacity="0.9">
+          ESCORTED
         </text>
       )}
 

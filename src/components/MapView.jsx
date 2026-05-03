@@ -306,11 +306,14 @@ export const MapView = ({
 
   const onUnitContextMenu = (u, e) => {
     if (state.selectedIds.length === 0) return;
-    if (u.faction === "friendly" && u.type === "USV" && !state.selectedIds.includes(u.id)) {
-      dispatch({ type: "ENGAGE_TARGET", targetId: u.id });
+    if (u.faction === "friendly") {
+      // Right-click any friendly unit not in the current selection → selected USVs escort it
+      if (!state.selectedIds.includes(u.id) && hasUSVSelected) {
+        dispatch({ type: "ENGAGE_TARGET", targetId: u.id });
+      }
       return;
     }
-    if (u.faction === "friendly") return;
+    // Right-click enemy/hostile → selected USVs engage/track (if detected)
     const det = state.detections[u.id];
     if (!det || det.confidence < CONFIG.POSSIBLE_THRESHOLD) return;
     dispatch({ type: "ENGAGE_TARGET", targetId: u.id });
@@ -329,10 +332,17 @@ export const MapView = ({
       sonar: u.type === "USV" ? CONFIG.SONAR_RANGE : 0,
     }));
 
-  // Units currently being tracked by a friendly USV (for amber auto-track highlight)
-  const trackedIds = new Set(
+  // Units currently being tracked by a friendly USV — split by target faction
+  const trackedEnemyIds = new Set(
     state.units
-      .filter((u) => u.faction === "friendly" && u.engageTargetId)
+      .filter((u) => u.faction === "friendly" && u.engageTargetId &&
+        state.units.find((t) => t.id === u.engageTargetId && t.faction !== "friendly"))
+      .map((u) => u.engageTargetId)
+  );
+  const trackedFriendlyIds = new Set(
+    state.units
+      .filter((u) => u.faction === "friendly" && u.engageTargetId &&
+        state.units.find((t) => t.id === u.engageTargetId && t.faction === "friendly"))
       .map((u) => u.engageTargetId)
   );
 
@@ -519,25 +529,30 @@ export const MapView = ({
           </g>
         ))}</g>
 
-      {/* ── Engage / track target lines ────────────────────────────────────── */}
+      {/* ── Engage / track / escort target lines ──────────────────────────── */}
       <g>{state.units
         .filter((u) => u.engageTargetId && u.faction === "friendly")
         .map((u) => {
           const tgt = state.units.find((x) => x.id === u.engageTargetId);
           if (!tgt) return null;
+          const isEscortLine = tgt.faction === "friendly";
+          const lineColor  = isEscortLine ? COLORS.phosphor : COLORS.amber;
+          const lineLabel  = isEscortLine ? "▶ ESCORT"     : "▶ TRACK";
+          const pulseDur   = isEscortLine ? "1.8s"         : "2s";
+          const dashOffset = isEscortLine ? "-9"           : "-9";
           return (
             <g key={`track-${u.id}`}>
               <line x1={u.x} y1={u.y} x2={tgt.x} y2={tgt.y}
-                stroke={COLORS.amber} strokeWidth="1.2" strokeDasharray="6 3" opacity="0.7">
-                <animate attributeName="stroke-dashoffset" from="0" to="-9" dur="1s" repeatCount="indefinite" />
+                stroke={lineColor} strokeWidth="1.2" strokeDasharray="6 3" opacity="0.7">
+                <animate attributeName="stroke-dashoffset" from="0" to={dashOffset} dur="1s" repeatCount="indefinite" />
               </line>
               <g transform={`translate(${tgt.x},${tgt.y})`}>
-                <circle r="14" fill="none" stroke={COLORS.amber} strokeWidth="1" opacity="0.7">
-                  <animate attributeName="r" values="14;20;14" dur="2s" repeatCount="indefinite" />
+                <circle r="14" fill="none" stroke={lineColor} strokeWidth="1" opacity="0.7">
+                  <animate attributeName="r" values="14;22;14" dur={pulseDur} repeatCount="indefinite" />
                 </circle>
                 <text y="-22" textAnchor="middle" fontSize="7"
-                  fontFamily="'JetBrains Mono', monospace" fill={COLORS.amber} letterSpacing="0.15em">
-                  ▶ TRACK
+                  fontFamily="'JetBrains Mono', monospace" fill={lineColor} letterSpacing="0.15em">
+                  {lineLabel}
                 </text>
               </g>
             </g>
@@ -591,7 +606,8 @@ export const MapView = ({
           detected={state.detections[u.id]}
           onClick={onClickUnit}
           onContextMenu={onUnitContextMenu}
-          isAutoTracked={u.faction !== "friendly" && trackedIds.has(u.id)}
+          isAutoTracked={u.faction !== "friendly" && trackedEnemyIds.has(u.id)}
+          isEscorted={u.faction === "friendly" && trackedFriendlyIds.has(u.id)}
           canTrack={u.faction !== "friendly" && hasUSVSelected &&
             (state.detections[u.id]?.confidence ?? 0) >= CONFIG.POSSIBLE_THRESHOLD} />
       ))}</g>
