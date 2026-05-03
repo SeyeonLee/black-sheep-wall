@@ -14,10 +14,10 @@ export const createISRUnit = (x, y, n = 1) => {
       engageTargetId: null, aisEngageMMSI: null },
     { id: newId("uav"), type: "UAV", faction: "friendly", x, y, heading: 0, battery: 88,
       state: "orbiting", parentId: usvId, orbitAngle: 0, label: "α",
-      missionTarget: null, missionAborted: false },
+      missionTarget: null, trackTargetId: null, missionAborted: false },
     { id: newId("uav"), type: "UAV", faction: "friendly", x, y, heading: 0, battery: 100,
       state: "docked", parentId: usvId, orbitAngle: Math.PI, label: "β",
-      missionTarget: null, missionAborted: false },
+      missionTarget: null, trackTargetId: null, missionAborted: false },
   ];
 };
 

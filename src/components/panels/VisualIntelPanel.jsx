@@ -45,17 +45,28 @@ export const VisualIntelPanel = ({ state, dispatch }) => {
 
   const readFile = (file) => {
     if (!file?.type.startsWith("image/")) return;
-    const reader = new FileReader();
-    reader.onload = (e) => {
-      const url = e.target.result;
-      setImageDataUrl(url);
-      setImageBase64(url.split(",")[1]);
-      setImageMime(file.type);
+    const objectUrl = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      URL.revokeObjectURL(objectUrl);
+      // Resize to max 1024px — OpenAI detail:low rescales anyway, no point sending a 10 MB body
+      const MAX = 1024;
+      const scale = Math.min(1, MAX / Math.max(img.width, img.height));
+      const w = Math.round(img.width * scale);
+      const h = Math.round(img.height * scale);
+      const canvas = document.createElement("canvas");
+      canvas.width = w; canvas.height = h;
+      canvas.getContext("2d").drawImage(img, 0, 0, w, h);
+      const dataUrl = canvas.toDataURL("image/jpeg", 0.85);
+      setImageDataUrl(dataUrl);
+      setImageBase64(dataUrl.split(",")[1]);
+      setImageMime("image/jpeg");
       setExtraction(null); setComparison(null); setError(null);
       setAisTarget(findNearestAIS());
       setDeployedTarget(findNearestDeployed());
     };
-    reader.readAsDataURL(file);
+    img.onerror = () => { URL.revokeObjectURL(objectUrl); setError("Could not load image file."); };
+    img.src = objectUrl;
   };
 
   const compareWithRealAIS = (ex, ship) => {
@@ -141,7 +152,12 @@ Respond ONLY with a valid JSON object — no markdown, no preamble:
         setComparison({ mode: "none", match: true, diffs: [] });
       }
     } catch (e) {
-      setError(e.message);
+      // TypeError = network-level failure (CORS, offline, payload too large)
+      // Other = API returned a parseable error above
+      const msg = e instanceof TypeError
+        ? `Network error — check your connection or API key (${e.message})`
+        : e.message;
+      setError(msg);
     } finally {
       setAnalyzing(false);
     }

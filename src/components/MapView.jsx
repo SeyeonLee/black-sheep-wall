@@ -282,6 +282,10 @@ export const MapView = ({
   const hasUSVSelected = state.units.some(
     (x) => state.selectedIds.includes(x.id) && x.type === "USV"
   );
+  // Airborne (non-docked) UAV in selection — can be ordered to orbit a target unit
+  const hasAirborneUAVSelected = state.units.some(
+    (x) => state.selectedIds.includes(x.id) && x.type === "UAV" && x.state !== "docked"
+  );
 
   const onClickUnit = (u, e) => {
     if (u.faction !== "friendly") {
@@ -307,13 +311,14 @@ export const MapView = ({
   const onUnitContextMenu = (u, e) => {
     if (state.selectedIds.length === 0) return;
     if (u.faction === "friendly") {
-      // Right-click any friendly unit not in the current selection → selected USVs escort it
-      if (!state.selectedIds.includes(u.id) && hasUSVSelected) {
+      // Right-click any friendly not in selection → selected USVs/UAVs escort/follow it
+      if (!state.selectedIds.includes(u.id) && (hasUSVSelected || hasAirborneUAVSelected)) {
         dispatch({ type: "ENGAGE_TARGET", targetId: u.id });
       }
       return;
     }
-    // Right-click enemy/hostile → selected USVs engage/track (if detected)
+    // Right-click enemy/neutral → selected USVs engage; selected UAVs orbit (if detected)
+    if (!hasUSVSelected && !hasAirborneUAVSelected) return;
     const det = state.detections[u.id];
     if (!det || det.confidence < CONFIG.POSSIBLE_THRESHOLD) return;
     dispatch({ type: "ENGAGE_TARGET", targetId: u.id });
@@ -332,18 +337,25 @@ export const MapView = ({
       sonar: u.type === "USV" ? CONFIG.SONAR_RANGE : 0,
     }));
 
-  // Units currently being tracked by a friendly USV — split by target faction
+  // Units currently being tracked by any friendly (USV engageTargetId or UAV trackTargetId)
+  // Split by target faction for visual differentiation
   const trackedEnemyIds = new Set(
     state.units
-      .filter((u) => u.faction === "friendly" && u.engageTargetId &&
-        state.units.find((t) => t.id === u.engageTargetId && t.faction !== "friendly"))
-      .map((u) => u.engageTargetId)
+      .filter((u) => u.faction === "friendly")
+      .flatMap((u) => [u.engageTargetId, u.trackTargetId].filter(Boolean))
+      .filter((id) => {
+        const t = state.units.find((x) => x.id === id);
+        return t && t.faction !== "friendly";
+      })
   );
   const trackedFriendlyIds = new Set(
     state.units
-      .filter((u) => u.faction === "friendly" && u.engageTargetId &&
-        state.units.find((t) => t.id === u.engageTargetId && t.faction === "friendly"))
-      .map((u) => u.engageTargetId)
+      .filter((u) => u.faction === "friendly")
+      .flatMap((u) => [u.engageTargetId, u.trackTargetId].filter(Boolean))
+      .filter((id) => {
+        const t = state.units.find((x) => x.id === id);
+        return t && t.faction === "friendly";
+      })
   );
 
   const vbW = CONFIG.WORLD_W / cam.zoom;
@@ -508,26 +520,54 @@ export const MapView = ({
         </g>
       ))}</g>
 
-      {/* ── UAV mission target lines ───────────────────────────────────────── */}
+      {/* ── UAV mission target lines (fixed-point and unit-track) ─────────── */}
       <g>{state.units
-        .filter((u) => u.type === "UAV" && u.missionTarget &&
-                       (u.state === "flying_to_mission" || u.state === "mission_orbit"))
-        .map((u) => (
-          <g key={`mission-${u.id}`}>
-            <line x1={u.x} y1={u.y} x2={u.missionTarget.x} y2={u.missionTarget.y}
-              stroke={COLORS.amber} strokeWidth="1" strokeDasharray="6 3" opacity="0.6">
-              <animate attributeName="stroke-dashoffset" from="0" to="-9" dur="1s" repeatCount="indefinite" />
-            </line>
-            <g transform={`translate(${u.missionTarget.x},${u.missionTarget.y})`}>
-              <circle r="16" fill="none" stroke={COLORS.amber} strokeWidth="1" opacity="0.5" strokeDasharray="4 4" />
-              <circle r="4" fill="none" stroke={COLORS.amber} strokeWidth="1.5" opacity="0.9" />
-              <text y="-22" textAnchor="middle" fontSize="7"
-                fontFamily="'JetBrains Mono', monospace" fill={COLORS.amber} letterSpacing="0.15em">
-                {u.state === "mission_orbit" ? "▶ ON-STATION" : "▶ EN ROUTE"}
-              </text>
+        .filter((u) => u.type === "UAV" &&
+          (u.state === "flying_to_mission" || u.state === "mission_orbit") &&
+          (u.missionTarget || u.trackTargetId))
+        .map((u) => {
+          const tgtUnit = u.trackTargetId
+            ? state.units.find((x) => x.id === u.trackTargetId)
+            : null;
+          const tgtPos = tgtUnit ?? u.missionTarget;
+          if (!tgtPos) return null;
+
+          const isFriendlyTgt = tgtUnit?.faction === "friendly";
+          const lineColor = tgtUnit
+            ? (isFriendlyTgt ? COLORS.phosphor : COLORS.amber)
+            : COLORS.amber;
+          const statusLabel = u.state === "mission_orbit"
+            ? (isFriendlyTgt ? "▶ ESCORT" : "▶ ON-STATION")
+            : (isFriendlyTgt ? "▶ ESCORT" : "▶ EN ROUTE");
+
+          return (
+            <g key={`mission-${u.id}`}>
+              <line x1={u.x} y1={u.y} x2={tgtPos.x} y2={tgtPos.y}
+                stroke={lineColor} strokeWidth="1" strokeDasharray="6 3" opacity="0.6">
+                <animate attributeName="stroke-dashoffset" from="0" to="-9" dur="1s" repeatCount="indefinite" />
+              </line>
+              {/* Fixed-point target: show crosshair marker */}
+              {!tgtUnit && (
+                <g transform={`translate(${tgtPos.x},${tgtPos.y})`}>
+                  <circle r="16" fill="none" stroke={lineColor} strokeWidth="1" opacity="0.5" strokeDasharray="4 4" />
+                  <circle r="4" fill="none" stroke={lineColor} strokeWidth="1.5" opacity="0.9" />
+                  <text y="-22" textAnchor="middle" fontSize="7"
+                    fontFamily="'JetBrains Mono', monospace" fill={lineColor} letterSpacing="0.15em">
+                    {statusLabel}
+                  </text>
+                </g>
+              )}
+              {/* Unit target: just float the label above the tracked unit */}
+              {tgtUnit && (
+                <text x={tgtPos.x} y={tgtPos.y - 36} textAnchor="middle" fontSize="7"
+                  fontFamily="'JetBrains Mono', monospace" fill={lineColor} letterSpacing="0.15em"
+                  pointerEvents="none">
+                  {statusLabel}
+                </text>
+              )}
             </g>
-          </g>
-        ))}</g>
+          );
+        })}</g>
 
       {/* ── Engage / track / escort target lines ──────────────────────────── */}
       <g>{state.units
@@ -608,8 +648,12 @@ export const MapView = ({
           onContextMenu={onUnitContextMenu}
           isAutoTracked={u.faction !== "friendly" && trackedEnemyIds.has(u.id)}
           isEscorted={u.faction === "friendly" && trackedFriendlyIds.has(u.id)}
-          canTrack={u.faction !== "friendly" && hasUSVSelected &&
-            (state.detections[u.id]?.confidence ?? 0) >= CONFIG.POSSIBLE_THRESHOLD} />
+          canTrack={
+            !state.selectedIds.includes(u.id) &&
+            (hasUSVSelected || hasAirborneUAVSelected) &&
+            (u.faction === "friendly" ||
+              (state.detections[u.id]?.confidence ?? 0) >= CONFIG.POSSIBLE_THRESHOLD)
+          } />
       ))}</g>
 
       {/* ── Mine markers (persistent, click × to remove) ───────────────────── */}

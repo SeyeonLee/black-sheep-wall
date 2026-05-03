@@ -1,9 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Read(//c/Users/Owner/OneDrive - thecovenant.tech/The Covenant Shared/Product/CerebralValley Hackathon/black-sheep-wall/**)",
-      "Bash(npx tsc *)",
-      "Bash(npm run *)"
-    ]
-  }
-}

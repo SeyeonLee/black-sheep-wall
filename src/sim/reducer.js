@@ -103,9 +103,14 @@ export const reducer = (state, action) => {
         }
       });
 
-      // ── #2 Auto-track newly detected submarines (idle USVs) ─────────────────
+      // ── #2 Auto-track newly detected submarines / hostiles (idle USVs) ────────
       const prevDetFn = (id) => state.detections[id]?.confidence ?? 0;
       const curDetFn  = (id) => detections[id]?.confidence ?? 0;
+
+      // Returns true if any friendly unit (USV or UAV) is already tracking this target
+      const isAlreadyTracked = (targetId) =>
+        units.some((u) => u.faction === "friendly" &&
+          (u.engageTargetId === targetId || u.trackTargetId === targetId));
 
       const newSubContacts = units.filter((u) =>
         u.type === "SUBMARINE" &&
@@ -114,6 +119,7 @@ export const reducer = (state, action) => {
       );
       if (newSubContacts.length > 0) {
         newSubContacts.forEach((sub) => {
+          if (isAlreadyTracked(sub.id)) return; // already covered — alert only
           const idleUSVs = units.filter((u) =>
             u.type === "USV" && u.faction === "friendly" &&
             u.state === "idle" && !u.engageTargetId && !u.aisEngageMMSI
@@ -129,7 +135,6 @@ export const reducer = (state, action) => {
         });
       }
 
-      // ── #2 Auto-track newly detected hostile surface vessels (idle USVs) ────
       const newHostileContacts = units.filter((u) =>
         u.type === "ENEMY" && u.faction === "hostile" &&
         prevDetFn(u.id) < CONFIG.POSSIBLE_THRESHOLD &&
@@ -137,6 +142,7 @@ export const reducer = (state, action) => {
       );
       if (newHostileContacts.length > 0) {
         newHostileContacts.forEach((hostile) => {
+          if (isAlreadyTracked(hostile.id)) return; // already covered — alert only
           const idleUSVs = units.filter((u) =>
             u.type === "USV" && u.faction === "friendly" &&
             u.state === "idle" && !u.engageTargetId && !u.aisEngageMMSI
@@ -152,8 +158,8 @@ export const reducer = (state, action) => {
         });
       }
 
-      // ── #3/#4 Patrol interrupt: patrolling USV spots confirmed contact ───────
-      // Build map: usvId → nearest target the USV can sense
+      // ── #3/#4 Patrol interrupt: patrolling USV spots untracked contact ───────
+      // Skip targets already being handled by another unit (don't double-assign)
       const patrolInterruptMap = {};
       for (const u of units) {
         if (u.type !== "USV" || u.faction !== "friendly") continue;
@@ -165,6 +171,7 @@ export const reducer = (state, action) => {
         for (const t of units) {
           if (t.type !== "ENEMY" && t.type !== "SUBMARINE") continue;
           if (curDetFn(t.id) < CONFIG.POSSIBLE_THRESHOLD) continue;
+          if (isAlreadyTracked(t.id)) continue; // already tracked — stay on patrol
           const range = t.type === "SUBMARINE" ? CONFIG.SONAR_RANGE : CONFIG.USV_SENSOR_RANGE;
           const d = Math.hypot(u.x - t.x, u.y - t.y);
           if (d <= range && d < bestDist) {
@@ -243,7 +250,7 @@ export const reducer = (state, action) => {
       const units = state.units.map((u) => {
         if (!state.selectedIds.includes(u.id) || u.type !== "UAV") return u;
         if (u.state === "flying_to_mission" || u.state === "mission_orbit") {
-          return { ...u, missionTarget: null, state: "returning" };
+          return { ...u, missionTarget: null, trackTargetId: null, state: "returning" };
         }
         return u;
       });
@@ -254,14 +261,36 @@ export const reducer = (state, action) => {
       const usvIds = state.units
         .filter((u) => state.selectedIds.includes(u.id) && u.type === "USV")
         .map((u) => u.id);
-      if (usvIds.length === 0) return state;
-      const cleared = clearOrdersForUSVs(state, usvIds);
-      const units = cleared.units.map((u) =>
-        usvIds.includes(u.id)
-          ? { ...u, engageTargetId: action.targetId, state: "tracking" }
-          : u
-      );
-      return { ...state, units, patrolAreas: cleared.patrolAreas };
+      // Airborne UAVs (not docked) can be assigned to orbit a target unit
+      const uavIds = state.units
+        .filter((u) => state.selectedIds.includes(u.id) && u.type === "UAV" && u.state !== "docked")
+        .map((u) => u.id);
+
+      if (usvIds.length === 0 && uavIds.length === 0) return state;
+
+      let result = state;
+
+      if (usvIds.length > 0) {
+        const cleared = clearOrdersForUSVs(result, usvIds);
+        const units = cleared.units.map((u) =>
+          usvIds.includes(u.id)
+            ? { ...u, engageTargetId: action.targetId, state: "tracking" }
+            : u
+        );
+        result = { ...result, units, patrolAreas: cleared.patrolAreas };
+      }
+
+      if (uavIds.length > 0) {
+        const units = result.units.map((u) =>
+          uavIds.includes(u.id)
+            ? { ...u, trackTargetId: action.targetId, missionTarget: null,
+                missionAborted: false, state: "flying_to_mission" }
+            : u
+        );
+        result = { ...result, units };
+      }
+
+      return result;
     }
 
     case "HOLD_SELECTED": {
@@ -356,9 +385,15 @@ export const reducer = (state, action) => {
         }, ...state.alerts].slice(0, 30),
       };
 
-    // ── #1 Mine marker removal ─────────────────────────────────────────────────
-    case "REMOVE_MINE_MARKER":
-      return { ...state, mineMarkers: state.mineMarkers.filter((m) => m.id !== action.id) };
+    // ── #1 Mine marker removal — also deletes the mine unit ───────────────────
+    case "REMOVE_MINE_MARKER": {
+      const marker = state.mineMarkers.find((m) => m.id === action.id);
+      return {
+        ...state,
+        mineMarkers: state.mineMarkers.filter((m) => m.id !== action.id),
+        units: marker ? state.units.filter((u) => u.id !== marker.mineId) : state.units,
+      };
+    }
 
     default: return state;
   }

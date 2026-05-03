@@ -22,7 +22,7 @@ export const tickUnit = (u, units, jamZones, dt) => {
     const activeState = u.state === "orbiting" || u.state === "flying_to_mission" || u.state === "mission_orbit";
     if (inJam && activeState) {
       next.state = "jammed";
-      next.missionAborted = u.missionTarget != null; // flag abort if on a mission
+      next.missionAborted = (u.missionTarget != null || u.trackTargetId != null);
       next.battery = Math.max(0, u.battery - CONFIG.UAV_BATTERY_DRAIN * dt);
       return next;
     }
@@ -41,8 +41,10 @@ export const tickUnit = (u, units, jamZones, dt) => {
       if (next.battery < CONFIG.UAV_LOW_BATTERY) next.state = "returning";
 
     } else if (u.state === "flying_to_mission") {
-      const target = u.missionTarget;
-      if (!target) { next.state = "returning"; return next; }
+      // Resolve target: tracked unit (moving) takes priority over fixed-point mission
+      const tgtUnit = u.trackTargetId ? units.find((x) => x.id === u.trackTargetId) : null;
+      const target = tgtUnit ?? u.missionTarget;
+      if (!target) { next.state = "returning"; next.trackTargetId = null; return next; }
 
       next.battery = Math.max(0, u.battery - CONFIG.UAV_BATTERY_DRAIN * dt);
 
@@ -67,8 +69,10 @@ export const tickUnit = (u, units, jamZones, dt) => {
       }
 
     } else if (u.state === "mission_orbit") {
-      const target = u.missionTarget;
-      if (!target) { next.state = "returning"; return next; }
+      // Resolve target: tracked unit (moving) takes priority over fixed-point mission
+      const tgtUnit = u.trackTargetId ? units.find((x) => x.id === u.trackTargetId) : null;
+      const target = tgtUnit ?? u.missionTarget;
+      if (!target) { next.state = "returning"; next.trackTargetId = null; return next; }
 
       next.battery = Math.max(0, u.battery - CONFIG.UAV_BATTERY_DRAIN * dt);
 
@@ -80,6 +84,7 @@ export const tickUnit = (u, units, jamZones, dt) => {
       }
 
       next.orbitAngle = u.orbitAngle + CONFIG.UAV_ORBIT_ANGULAR_SPEED * dt;
+      // Orbit around the target's current position (follows moving units)
       next.x = target.x + Math.cos(next.orbitAngle) * CONFIG.UAV_MISSION_ORBIT_RADIUS;
       next.y = target.y + Math.sin(next.orbitAngle) * CONFIG.UAV_MISSION_ORBIT_RADIUS;
       next.heading = next.orbitAngle + Math.PI / 2;
@@ -92,6 +97,7 @@ export const tickUnit = (u, units, jamZones, dt) => {
         next.state = "docked";
         next.x = parent.x; next.y = parent.y;
         next.missionTarget = null;
+        next.trackTargetId = null;
         next.missionAborted = false;
       } else {
         const v = norm({ x: dx, y: dy });
