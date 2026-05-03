@@ -3,7 +3,7 @@ import { Hexagon, Activity, Camera, Crosshair } from "lucide-react";
 
 import { CONFIG, COLORS } from "./config";
 import { worldToGeo, decodeAISType, geoToWorld } from "./utils";
-import { makeInitialState } from "./sim/factories";
+import { makeInitialState, generateAISFleet, pointAlongRoute } from "./sim/factories";
 import { reducer } from "./sim/reducer";
 
 import { TopBar } from "./components/TopBar";
@@ -22,23 +22,63 @@ export default function App() {
   const [deployType, setDeployType] = useState("ENEMY");
   const [hover, setHover] = useState(null);
   const [cursorWorld, setCursorWorld] = useState(null);
-  const [cam, setCam] = useState({ x: 0, y: 0, zoom: 0.55 });
+  // Camera centred on the ISR spawn at (2400, 1900) — middle of the First Island Chain
+  const [cam, setCam] = useState(() => {
+    const zoom = 0.9;
+    const vbW = CONFIG.WORLD_W / zoom;
+    const vbH = CONFIG.WORLD_H / zoom;
+    return { x: 2400 - vbW / 2, y: 1900 - vbH / 2, zoom };
+  });
   const [aisUsername, setAisUsername] = useState("");
   const [aisStatus, setAisStatus] = useState("disconnected");
   const aisUsernameRef = useRef(aisUsername);
   aisUsernameRef.current = aisUsername;
 
+  // Synthetic AIS fleet — always running, advances on every AIS_TICK_MS interval
+  const fleetRef = useRef(null);
+  useEffect(() => {
+    fleetRef.current = generateAISFleet();
+    dispatch({ type: "SET_AIS_SHIPS", ships: fleetRef.current });
+
+    const id = setInterval(() => {
+      if (!fleetRef.current) return;
+      fleetRef.current = fleetRef.current.map((ship) => {
+        // routePos wraps 0→1 (sinusoidal bounce inside pointAlongRoute)
+        const newRoutePos = ship.routePos + ship.routeSpeed;
+        const geo = pointAlongRoute(ship.route, newRoutePos);
+        const wp = geoToWorld(geo.lat, geo.lon);
+        // Approximate heading from position delta
+        const dx = wp.x - ship.wx, dy = wp.y - ship.wy;
+        const cog = dx !== 0 || dy !== 0
+          ? (Math.atan2(dy, dx) * 180 / Math.PI + 360) % 360
+          : ship.cog;
+        return {
+          ...ship,
+          routePos: newRoutePos,
+          lat: geo.lat, lon: geo.lon,
+          wx: wp.x, wy: wp.y,
+          cog, heading: cog,
+        };
+      });
+      dispatch({ type: "SET_AIS_SHIPS", ships: fleetRef.current });
+    }, CONFIG.AIS_TICK_MS);
+
+    return () => clearInterval(id);
+  }, []);
+
+  // Simulation tick
   useEffect(() => {
     if (state.paused) return;
     const id = setInterval(() => dispatch({ type: "TICK" }), CONFIG.TICK_MS);
     return () => clearInterval(id);
   }, [state.paused]);
 
+  // Real AIS fetch (AISHub — optional)
   const fetchAIS = useCallback(async (username) => {
     if (!username) return;
     setAisStatus("fetching");
     const usv = state.units.find((u) => u.type === "USV");
-    const centre = usv ? worldToGeo(usv.x, usv.y) : { lat: 37, lon: 126 };
+    const centre = usv ? worldToGeo(usv.x, usv.y) : { lat: 25, lon: 122 };
     const pad = CONFIG.AIS_RANGE_DEG;
     const latMin = (centre.lat - pad).toFixed(2);
     const latMax = (centre.lat + pad).toFixed(2);
@@ -73,7 +113,11 @@ export default function App() {
             imo:     s.IMO ? String(s.IMO) : null,
           };
         });
-      dispatch({ type: "SET_AIS_SHIPS", ships });
+      // Merge real AIS on top of synthetic fleet
+      const syntheticOnly = (fleetRef.current || []).filter(
+        (s) => !ships.find((r) => r.mmsi === s.mmsi)
+      );
+      dispatch({ type: "SET_AIS_SHIPS", ships: [...ships, ...syntheticOnly] });
       setAisStatus("ok");
     } catch (err) {
       console.warn("AIS fetch failed:", err.message);
@@ -88,6 +132,7 @@ export default function App() {
     return () => clearInterval(id);
   }, [aisUsername]);
 
+  // CSS reset injected once
   useEffect(() => {
     const style = document.createElement("style");
     style.id = "bsw-reset";
@@ -108,6 +153,7 @@ export default function App() {
     return () => { try { document.head.removeChild(style); } catch (e) {} };
   }, []);
 
+  // Fonts
   useEffect(() => {
     const link = document.createElement("link");
     link.rel = "stylesheet";
@@ -116,6 +162,7 @@ export default function App() {
     return () => { try { document.head.removeChild(link); } catch (e) {} };
   }, []);
 
+  // Keyboard shortcuts
   useEffect(() => {
     const onKey = (e) => {
       if (e.key === " ") { e.preventDefault(); dispatch({ type: "TOGGLE_PAUSE" }); }
@@ -138,6 +185,7 @@ export default function App() {
               aisUsername={aisUsername} setAisUsername={setAisUsername}
               aisStatus={aisStatus} onRefreshAIS={() => fetchAIS(aisUsername)} />
 
+      {/* Map area + alert feed side by side */}
       <div style={{ flex: "1 1 0", minHeight: 0, display: "flex", overflow: "hidden" }}>
         <div style={{ flex: "1 1 0", position: "relative", overflow: "hidden" }}>
           <MapView state={state} dispatch={dispatch}
@@ -148,6 +196,7 @@ export default function App() {
         <AlertFeed alerts={state.alerts} dispatch={dispatch} />
       </div>
 
+      {/* Bottom dock — 260px tall so all four panels have room */}
       <div style={{
         height: 260, flexShrink: 0, display: "flex",
         borderTop: `1px solid ${COLORS.border}`,
