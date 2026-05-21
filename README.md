@@ -3,8 +3,20 @@
 > **CerebralValley 3rd Annual NatSec Hackathon** — [Event Page](https://cerebralvalley.ai/e/3rd-annual-natsec-hackathon)
 
 ---
+<img width="2535" height="1450" alt="thumb" src="https://github.com/user-attachments/assets/78b5debc-5b00-49b7-8fa4-55a6562717ee" /> <br>
 
-<!-- INTRO — fill in here -->
+**Black Sheep Wall** is a cheat code in Blizzard's _Starcraft_ that reveals all the hidden areas on the map. \
+That is exactly what we're bringing for the maritime, fighting the fog or war admist the tyranny of distance. <br> <br />
+How do we spot dark vessels tampering with AIS? \
+How do we track underwater assets? \
+How do we provide high-resolution data to provide evidence of illegal activities on the water?  <br> <br />
+Our solar-powered, sonar-towing USV and its Starcraft-like command & control system easily enable continuous ISR underwater, in the air, and on the surface. 
+
+<img width="595" height="335" alt="drone_pic1" src="https://github.com/user-attachments/assets/a38c0e2f-39f7-4868-a485-d26d86c60962" />
+<img width="595" height="335" alt="drone_pic2" src="https://github.com/user-attachments/assets/d64788d4-1d1f-4fb4-9b28-417a1db97f8c" />
+
+
+
 
 ---
 
@@ -492,7 +504,8 @@ UAV_RETURN_BATTERY_MARGIN: 8  // % battery safety pad for proactive RTB
 ## Team
 
 <!-- Add team members here -->
-
+- Seyeon Lee (https://www.linkedin.com/in/seyeonlee/)
+- Jacob Nyhagen (https://www.linkedin.com/in/jacob-nyhagen-616b8427b/)
 ---
 
 *Built for the [CerebralValley 3rd Annual NatSec Hackathon](https://cerebralvalley.ai/e/3rd-annual-natsec-hackathon)*
