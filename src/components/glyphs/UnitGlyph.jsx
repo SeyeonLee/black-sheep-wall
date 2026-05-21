@@ -94,6 +94,37 @@ export const UnitGlyph = ({
         <line x1="-9" y1="0" x2="-13" y2="0" stroke={color} strokeWidth="1.2" />
       </g>
     );
+  } else if (unit.type === "TURRET") {
+    const firingColor = unit.isFiring ? COLORS.hostile : color;
+    glyph = (
+      <g>
+        {/* Fast-attack hull — pointed bow, wider stern */}
+        <path d="M 0 -13 L 9 5 L 6 10 L -6 10 L -9 5 Z"
+              fill="none" stroke={firingColor} strokeWidth="2" />
+        {/* Superstructure stripe */}
+        <line x1="-4" y1="2" x2="4" y2="2" stroke={firingColor} strokeWidth="1" opacity="0.6" />
+        {/* Turret circle */}
+        <circle r="4.5" cy="-1" fill={unit.isFiring ? COLORS.hostile : color}
+                opacity={unit.isFiring ? 1 : 0.85} />
+        {/* Gun barrel — points toward heading (forward = -Y since rotateGlyph is true) */}
+        <line x1="0" y1="-1" x2="0" y2="-14" stroke={firingColor} strokeWidth="2.5" />
+        {/* Muzzle flash when firing */}
+        {unit.isFiring && (
+          <g>
+            <circle cx="0" cy="-17" r="5" fill={COLORS.hostile} opacity="0.85">
+              <animate attributeName="r" values="3;8;3" dur="0.12s" repeatCount="indefinite" />
+              <animate attributeName="opacity" values="0.9;0.25;0.9" dur="0.12s" repeatCount="indefinite" />
+            </circle>
+            <line x1="-5" y1="-13" x2="5" y2="-19" stroke={COLORS.hostile} strokeWidth="1.5">
+              <animate attributeName="opacity" values="0.8;0.1;0.8" dur="0.10s" repeatCount="indefinite" />
+            </line>
+            <line x1="5" y1="-13" x2="-5" y2="-19" stroke={COLORS.hostile} strokeWidth="1.5">
+              <animate attributeName="opacity" values="0.8;0.1;0.8" dur="0.10s" repeatCount="indefinite" />
+            </line>
+          </g>
+        )}
+      </g>
+    );
   }
 
   return (
@@ -180,6 +211,32 @@ export const UnitGlyph = ({
         <text x="14" y="0" fontSize="6.5" fontFamily="'JetBrains Mono', monospace"
               fill={COLORS.phosphor} letterSpacing="0.1em" opacity="0.9">
           ESCORTED
+        </text>
+      )}
+
+      {/* ── Health bar (units with health) ───────────────────────────────── */}
+      {unit.health != null && unit.maxHealth != null && unit.maxHealth > 0 && (
+        <g transform="translate(0, 18)">
+          <rect x="-13" y="0" width="26" height="3"
+                fill="none" stroke={color} strokeWidth="0.5" opacity="0.5" />
+          <rect x="-13" y="0"
+                width={26 * Math.max(0, unit.health / unit.maxHealth)} height="3"
+                fill={unit.health / unit.maxHealth > 0.5 ? COLORS.phosphor :
+                      unit.health / unit.maxHealth > 0.25 ? COLORS.amber : COLORS.hostile}
+                opacity="0.85" />
+        </g>
+      )}
+
+      {/* ── TURRET attack-mode status label ──────────────────────────────── */}
+      {unit.type === "TURRET" && isFriendly && (
+        <text x="14" y="0" fontSize="6.5" fontFamily="'JetBrains Mono', monospace"
+              fill={unit.isFiring ? COLORS.hostile :
+                    unit.attackMode ? COLORS.amber :
+                    unit.attackSuppressed ? COLORS.phosphorDim : COLORS.textDim}
+              letterSpacing="0.1em">
+          {unit.isFiring ? "FIRING" :
+           unit.attackMode ? "ARMED" :
+           unit.attackSuppressed ? "SHADOW" : "SAFE"}
         </text>
       )}
 

@@ -6,22 +6,44 @@ let _idCounter = 1;
 export const newId = (p) => `${p}-${_idCounter++}`;
 
 // ─── Unit factories ───────────────────────────────────────────────────────────
-export const createISRUnit = (x, y, n = 1) => {
+export const createISRUnit = (x, y, n = 1, settings = {}) => {
   const usvId = newId("usv");
   return [
-    { id: usvId, type: "USV", faction: "friendly", x, y, heading: 0, battery: 92,
+    { id: usvId, type: "USV", faction: "friendly", x, y, heading: 0,
+      battery: settings.battery ?? 92,
       state: "idle", goal: null, label: `ISR-${n}`, patrolPath: null, patrolIdx: 0,
-      engageTargetId: null, aisEngageMMSI: null },
+      engageTargetId: null, aisEngageMMSI: null,
+      speed: settings.speed ?? CONFIG.USV_SPEED,
+      health: settings.health ?? CONFIG.HEALTH_USV,
+      maxHealth: settings.health ?? CONFIG.HEALTH_USV },
     { id: newId("uav"), type: "UAV", faction: "friendly", x, y, heading: 0, battery: 88,
       state: "orbiting", parentId: usvId, orbitAngle: 0, label: "α",
-      missionTarget: null, trackTargetId: null, missionAborted: false },
+      missionTarget: null, trackTargetId: null, missionAborted: false,
+      health: 5, maxHealth: 5 },
     { id: newId("uav"), type: "UAV", faction: "friendly", x, y, heading: 0, battery: 100,
       state: "docked", parentId: usvId, orbitAngle: Math.PI, label: "β",
-      missionTarget: null, trackTargetId: null, missionAborted: false },
+      missionTarget: null, trackTargetId: null, missionAborted: false,
+      health: 5, maxHealth: 5 },
   ];
 };
 
-export const createCommercialVessel = (x, y) => ({
+export const createTurretUnit = (x, y, n = 1, settings = {}) => ({
+  id: newId("trt"), type: "TURRET", faction: "friendly",
+  x, y, heading: 0,
+  battery: settings.battery ?? 92,
+  state: "idle", goal: null, label: `TRT-${n}`, patrolPath: null, patrolIdx: 0,
+  engageTargetId: null,
+  attackMode: false,
+  attackSuppressed: false,
+  ammo: settings.ammo ?? CONFIG.TURRET_AMMO,
+  maxAmmo: settings.ammo ?? CONFIG.TURRET_AMMO,
+  isFiring: false,
+  speed: settings.speed ?? CONFIG.TURRET_SPEED,
+  health: settings.health ?? CONFIG.HEALTH_TURRET,
+  maxHealth: settings.health ?? CONFIG.HEALTH_TURRET,
+});
+
+export const createCommercialVessel = (x, y, settings = {}) => ({
   id: newId("com"), type: "COMMERCIAL", faction: "neutral",
   x, y, heading: Math.random() * Math.PI * 2, battery: 100, state: "transit",
   goal: { x: x + (Math.random() - 0.5) * 1500, y: y + (Math.random() - 0.5) * 1500 },
@@ -30,26 +52,37 @@ export const createCommercialVessel = (x, y) => ({
   imo: `IMO${Math.floor(Math.random() * 9000000 + 1000000)}`,
   flag: ["KOR", "PAN", "LBR", "MSH", "SGP", "HKG"][Math.floor(Math.random() * 6)],
   vesselType: ["TANKER", "CARGO", "BULK", "CONT"][Math.floor(Math.random() * 4)],
+  speed: settings.speed ?? CONFIG.COMMERCIAL_SPEED,
+  health: settings.health ?? CONFIG.HEALTH_COMMERCIAL,
+  maxHealth: settings.health ?? CONFIG.HEALTH_COMMERCIAL,
 });
 
-export const createEnemyVessel = (x, y) => ({
+export const createEnemyVessel = (x, y, settings = {}) => ({
   id: newId("hos"), type: "ENEMY", faction: "hostile",
   x, y, heading: Math.random() * Math.PI * 2, battery: 100, state: "transit",
   goal: { x: x + (Math.random() - 0.5) * 1200, y: y + (Math.random() - 0.5) * 1200 },
   label: `UNK-${Math.floor(Math.random() * 99 + 10)}`,
+  speed: settings.speed ?? CONFIG.ENEMY_SPEED,
+  health: settings.health ?? CONFIG.HEALTH_ENEMY,
+  maxHealth: settings.health ?? CONFIG.HEALTH_ENEMY,
 });
 
-export const createSubmarine = (x, y) => ({
+export const createSubmarine = (x, y, settings = {}) => ({
   id: newId("sub"), type: "SUBMARINE", faction: "hostile",
   x, y, heading: Math.random() * Math.PI * 2, battery: 100, state: "transit",
   goal: { x: x + (Math.random() - 0.5) * 1200, y: y + (Math.random() - 0.5) * 1200 },
   label: `SS-${Math.floor(Math.random() * 99 + 10)}`,
+  speed: settings.speed ?? CONFIG.SUBMARINE_SPEED,
+  health: settings.health ?? CONFIG.HEALTH_SUBMARINE,
+  maxHealth: settings.health ?? CONFIG.HEALTH_SUBMARINE,
 });
 
-export const createMine = (x, y) => ({
+export const createMine = (x, y, settings = {}) => ({
   id: newId("min"), type: "MINE", faction: "hostile",
   x, y, heading: 0, battery: 100, state: "moored",
   goal: null, label: `MIN-${Math.floor(Math.random() * 99 + 10)}`,
+  health: settings.health ?? CONFIG.HEALTH_MINE,
+  maxHealth: settings.health ?? CONFIG.HEALTH_MINE,
 });
 
 export const createJamZone = (x, y) => ({
@@ -185,5 +218,14 @@ export const makeInitialState = () => {
     fogReveal: [],
     simSpeed: 1, paused: false, simTime: 0,
     isrCount: 1,
+    turretCount: 0,
+    unitSettings: {
+      USV:        { speed: CONFIG.USV_SPEED,        battery: 92,  health: CONFIG.HEALTH_USV },
+      TURRET:     { speed: CONFIG.TURRET_SPEED,     battery: 92,  health: CONFIG.HEALTH_TURRET },
+      ENEMY:      { speed: CONFIG.ENEMY_SPEED,                    health: CONFIG.HEALTH_ENEMY },
+      COMMERCIAL: { speed: CONFIG.COMMERCIAL_SPEED,               health: CONFIG.HEALTH_COMMERCIAL },
+      SUBMARINE:  { speed: CONFIG.SUBMARINE_SPEED,                health: CONFIG.HEALTH_SUBMARINE },
+      MINE:       {                                               health: CONFIG.HEALTH_MINE },
+    },
   };
 };

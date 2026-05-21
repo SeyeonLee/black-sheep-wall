@@ -1,4 +1,4 @@
-import { Anchor, Plane } from "lucide-react";
+import { Anchor, Plane, Crosshair } from "lucide-react";
 import { COLORS } from "../../config";
 import { rad2deg } from "../../utils";
 
@@ -26,10 +26,41 @@ const BatteryBar = ({ value }) => {
   );
 };
 
+const HealthBar = ({ value, max }) => {
+  const pct = max > 0 ? Math.max(0, value / max) : 0;
+  const color = pct > 0.5 ? COLORS.phosphor : pct > 0.25 ? COLORS.amber : COLORS.hostile;
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+      <div style={{ width: 36, height: 4, border: `1px solid ${COLORS.border}`, background: COLORS.bg }}>
+        <div style={{ width: `${pct * 100}%`, height: "100%", background: color }} />
+      </div>
+      <span style={{ fontSize: 9, color, minWidth: 36 }}>
+        {Math.round(value)}/{max}
+      </span>
+    </div>
+  );
+};
+
+const AmmoBar = ({ value, max }) => {
+  const pct = max > 0 ? Math.max(0, value / max) : 0;
+  const color = pct > 0.4 ? COLORS.phosphor : pct > 0.15 ? COLORS.amber : COLORS.hostile;
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+      <div style={{ width: 36, height: 4, border: `1px solid ${COLORS.border}`, background: COLORS.bg }}>
+        <div style={{ width: `${pct * 100}%`, height: "100%", background: color }} />
+      </div>
+      <span style={{ fontSize: 9, color, minWidth: 36 }}>
+        {Math.round(value)}/{max}
+      </span>
+    </div>
+  );
+};
+
 export const StatusPanel = ({ state, dispatch }) => {
   const friendly = state.units.filter((u) => u.faction === "friendly");
   const selectedFriendly = state.units.filter((u) => state.selectedIds.includes(u.id));
   const usvSel = selectedFriendly.find((u) => u.type === "USV");
+  const trtSel = !usvSel && selectedFriendly.find((u) => u.type === "TURRET");
 
   const onRosterClick = (u) => {
     if (u.type === "USV") {
@@ -57,8 +88,9 @@ export const StatusPanel = ({ state, dispatch }) => {
                   cursor: "pointer", fontFamily: "inherit",
                 }}>
                 <div style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0 }}>
-                  {u.type === "USV" && <Anchor size={10} style={{ color: COLORS.phosphor, flexShrink: 0 }} />}
-                  {u.type === "UAV" && <Plane size={10} style={{ color: COLORS.phosphor, flexShrink: 0 }} />}
+                  {u.type === "USV"    && <Anchor   size={10} style={{ color: COLORS.phosphor, flexShrink: 0 }} />}
+                  {u.type === "UAV"    && <Plane     size={10} style={{ color: COLORS.phosphor, flexShrink: 0 }} />}
+                  {u.type === "TURRET" && <Crosshair size={10} style={{ color: COLORS.amber,   flexShrink: 0 }} />}
                   <span style={{ color: isSel ? COLORS.phosphor : COLORS.text }}>{u.label}</span>
                   <span style={{ fontSize: 9, color: COLORS.textDim, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                     {u.state.toUpperCase().replace(/_/g, " ")}
@@ -73,6 +105,8 @@ export const StatusPanel = ({ state, dispatch }) => {
 
       <div style={{ padding: 8, flex: "1 1 0", overflowY: "auto", minHeight: 0 }}>
         <div style={{ fontSize: 9, letterSpacing: "0.1em", marginBottom: 6, color: COLORS.textDim }}>SELECTED</div>
+
+        {/* ── USV selected ──────────────────────────────────────────────────── */}
         {usvSel ? (
           <div style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 10, color: COLORS.text }}>
             <Row k="UNIT" v={usvSel.label} />
@@ -80,8 +114,8 @@ export const StatusPanel = ({ state, dispatch }) => {
             <Row k="STATE" v={usvSel.state.toUpperCase().replace(/_/g, " ")}
                  vColor={
                    usvSel.state === "patrolling" ? COLORS.amber :
-                   usvSel.state === "tracking" ? COLORS.amber :
-                   usvSel.state === "jammed" ? COLORS.hostile :
+                   usvSel.state === "tracking"   ? COLORS.amber :
+                   usvSel.state === "jammed"     ? COLORS.hostile :
                    COLORS.phosphor
                  } />
             {usvSel.engageTargetId && (() => {
@@ -93,8 +127,66 @@ export const StatusPanel = ({ state, dispatch }) => {
             <Row k="BATT" v={`${Math.round(usvSel.battery)}%`}
                  vColor={usvSel.battery > 60 ? COLORS.phosphor :
                          usvSel.battery > 30 ? COLORS.amber : COLORS.hostile} />
+            {usvSel.health != null && (
+              <div style={{ display: "flex", justifyContent: "space-between", borderBottom: `1px dashed ${COLORS.border}`, paddingBottom: 2 }}>
+                <span style={{ color: COLORS.textDim }}>HEALTH</span>
+                <HealthBar value={usvSel.health} max={usvSel.maxHealth} />
+              </div>
+            )}
             <Row k="GROUP" v={`+${selectedFriendly.length - 1} attached`} />
           </div>
+
+        /* ── TURRET selected ─────────────────────────────────────────────── */
+        ) : trtSel ? (
+          <div style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 10, color: COLORS.text }}>
+            <Row k="UNIT" v={trtSel.label} />
+            <Row k="TYPE" v="TURRET" />
+            <Row k="STATE" v={trtSel.state.toUpperCase().replace(/_/g, " ")}
+                 vColor={
+                   trtSel.isFiring    ? COLORS.hostile :
+                   trtSel.state === "tracking"   ? COLORS.amber :
+                   trtSel.state === "patrolling" ? COLORS.amber :
+                   trtSel.state === "jammed"     ? COLORS.hostile :
+                   COLORS.phosphor
+                 } />
+            <Row k="WEAPON"
+                 v={trtSel.isFiring ? "FIRING" : trtSel.attackMode ? "ARMED" : trtSel.attackSuppressed ? "SHADOW" : "SAFE"}
+                 vColor={trtSel.isFiring ? COLORS.hostile : trtSel.attackMode ? COLORS.amber : COLORS.phosphor} />
+            {trtSel.engageTargetId && (() => {
+              const tgt = state.units.find((x) => x.id === trtSel.engageTargetId);
+              return tgt ? <Row k="TARGET" v={tgt.label} vColor={COLORS.hostile} /> : null;
+            })()}
+            <Row k="POS" v={`${Math.round(trtSel.x)}, ${Math.round(trtSel.y)}`} />
+            <Row k="HDG" v={`${(Math.round(rad2deg(trtSel.heading)) + 360) % 360}°`} />
+            <Row k="BATT" v={`${Math.round(trtSel.battery)}%`}
+                 vColor={trtSel.battery > 60 ? COLORS.phosphor :
+                         trtSel.battery > 30 ? COLORS.amber : COLORS.hostile} />
+            {trtSel.ammo != null && (
+              <div style={{ display: "flex", justifyContent: "space-between", borderBottom: `1px dashed ${COLORS.border}`, paddingBottom: 2 }}>
+                <span style={{ color: COLORS.textDim }}>AMMO</span>
+                <AmmoBar value={trtSel.ammo} max={trtSel.maxAmmo} />
+              </div>
+            )}
+            {trtSel.health != null && (
+              <div style={{ display: "flex", justifyContent: "space-between", borderBottom: `1px dashed ${COLORS.border}`, paddingBottom: 2 }}>
+                <span style={{ color: COLORS.textDim }}>HEALTH</span>
+                <HealthBar value={trtSel.health} max={trtSel.maxHealth} />
+              </div>
+            )}
+            {/* Quick-arm button */}
+            {trtSel.engageTargetId && !trtSel.attackMode && (
+              <button onClick={() => dispatch({ type: "TURRET_ATTACK_AUTHORIZE", turretId: trtSel.id })}
+                style={{
+                  marginTop: 4, padding: "5px 0",
+                  background: `${COLORS.hostile}18`, border: `1px solid ${COLORS.hostile}`,
+                  color: COLORS.hostile, cursor: "pointer",
+                  fontFamily: "'JetBrains Mono', monospace", fontSize: 9, fontWeight: 700, letterSpacing: "0.1em",
+                }}>
+                ▶ ARM WEAPONS
+              </button>
+            )}
+          </div>
+
         ) : (
           <div style={{ color: COLORS.textDim, fontSize: 10 }}>
             // No unit selected.<br />

@@ -120,12 +120,13 @@ export const tickUnit = (u, units, jamZones, dt) => {
       return next;
     }
 
+    const usvSpeed = u.speed ?? CONFIG.USV_SPEED;
     const inJam = jamZones.find((jz) => dist(u, jz) < jz.radius);
     if (inJam) {
       const dx = u.x - inJam.x, dy = u.y - inJam.y;
       const d = Math.hypot(dx, dy) || 1;
       const v = { x: dx / d, y: dy / d };
-      const pos = moveIfWater(u, u.x + v.x * CONFIG.USV_SPEED * dt, u.y + v.y * CONFIG.USV_SPEED * dt);
+      const pos = moveIfWater(u, u.x + v.x * usvSpeed * dt, u.y + v.y * usvSpeed * dt);
       next.x = pos.x; next.y = pos.y;
       next.heading = angleOf(v.x, v.y);
       next.state = "jammed";
@@ -146,7 +147,7 @@ export const tickUnit = (u, units, jamZones, dt) => {
         const d = Math.hypot(dx, dy);
         if (d > CONFIG.TRACK_STANDOFF) {
           const vv = norm({ x: dx, y: dy });
-          const pos = moveIfWater(u, u.x + vv.x * CONFIG.USV_SPEED * dt, u.y + vv.y * CONFIG.USV_SPEED * dt);
+          const pos = moveIfWater(u, u.x + vv.x * usvSpeed * dt, u.y + vv.y * usvSpeed * dt);
           next.x = pos.x; next.y = pos.y;
         }
         next.heading = angleOf(dx, dy);
@@ -169,7 +170,7 @@ export const tickUnit = (u, units, jamZones, dt) => {
         else { next.goal = null; next.state = "idle"; }
       } else {
         const v = norm({ x: dx, y: dy });
-        const pos = moveIfWater(u, u.x + v.x * CONFIG.USV_SPEED * dt, u.y + v.y * CONFIG.USV_SPEED * dt);
+        const pos = moveIfWater(u, u.x + v.x * usvSpeed * dt, u.y + v.y * usvSpeed * dt);
         next.x = pos.x; next.y = pos.y;
         next.heading = angleOf(dx, dy);
         next.state = u.patrolPath ? "patrolling" : "moving";
@@ -177,6 +178,88 @@ export const tickUnit = (u, units, jamZones, dt) => {
     } else if (!u.patrolPath) next.state = "idle";
     next.battery = Math.max(0, u.battery - CONFIG.USV_BATTERY_DRAIN * dt);
     if (next.battery < CONFIG.USV_LOW_BATTERY) next.state = "charging";
+    return next;
+  }
+
+  if (u.type === "TURRET") {
+    // Charging via solar
+    if (u.state === "charging") {
+      next.battery = Math.min(100, u.battery + CONFIG.TURRET_SOLAR_RATE * dt);
+      if (next.battery > 80) next.state = "idle";
+      next.isFiring = false;
+      return next;
+    }
+
+    const trtSpeed = u.speed ?? CONFIG.TURRET_SPEED;
+
+    // Jam: flee zone
+    const inJamTRT = jamZones.find((jz) => dist(u, jz) < jz.radius);
+    if (inJamTRT) {
+      const dx = u.x - inJamTRT.x, dy = u.y - inJamTRT.y;
+      const d = Math.hypot(dx, dy) || 1;
+      const v = { x: dx / d, y: dy / d };
+      const pos = moveIfWater(u, u.x + v.x * trtSpeed * dt, u.y + v.y * trtSpeed * dt);
+      next.x = pos.x; next.y = pos.y;
+      next.heading = angleOf(v.x, v.y);
+      next.state = "jammed";
+      next.isFiring = false;
+      next.battery = Math.max(0, u.battery - CONFIG.TURRET_BATTERY_DRAIN * dt);
+      return next;
+    }
+
+    // Engage target
+    if (u.engageTargetId) {
+      const tgt = units.find((x) => x.id === u.engageTargetId);
+      if (!tgt) {
+        next.engageTargetId = null; next.state = "idle"; next.isFiring = false;
+        return next;
+      }
+      const dx = tgt.x - u.x, dy = tgt.y - u.y;
+      const d = Math.hypot(dx, dy);
+      next.heading = angleOf(dx, dy);
+      next.state = "tracking";
+
+      if (d <= CONFIG.TURRET_FIRE_RANGE && u.attackMode && u.ammo > 0) {
+        // In range, weapons free, ammo available → fire
+        next.isFiring = true;
+        next.ammo = Math.max(0, u.ammo - CONFIG.TURRET_FIRE_RATE * dt);
+      } else {
+        next.isFiring = false;
+        if (d > CONFIG.TURRET_FIRE_RANGE) {
+          // Close in to firing range
+          const vv = norm({ x: dx, y: dy });
+          const pos = moveIfWater(u, u.x + vv.x * trtSpeed * dt, u.y + vv.y * trtSpeed * dt);
+          next.x = pos.x; next.y = pos.y;
+        }
+      }
+
+      next.battery = Math.max(0, u.battery - CONFIG.TURRET_BATTERY_DRAIN * dt);
+      if (next.battery < CONFIG.TURRET_LOW_BATTERY) { next.state = "charging"; next.isFiring = false; }
+      return next;
+    }
+
+    // Patrol / goal movement
+    let trtTarget = u.goal;
+    if (u.patrolPath && u.patrolPath.length > 0) {
+      trtTarget = u.patrolPath[u.patrolIdx % u.patrolPath.length];
+    }
+    if (trtTarget) {
+      const dx = trtTarget.x - u.x, dy = trtTarget.y - u.y;
+      const d = Math.hypot(dx, dy);
+      if (d < 6) {
+        if (u.patrolPath) next.patrolIdx = (u.patrolIdx + 1) % u.patrolPath.length;
+        else { next.goal = null; next.state = "idle"; }
+      } else {
+        const v = norm({ x: dx, y: dy });
+        const pos = moveIfWater(u, u.x + v.x * trtSpeed * dt, u.y + v.y * trtSpeed * dt);
+        next.x = pos.x; next.y = pos.y;
+        next.heading = angleOf(dx, dy);
+        next.state = u.patrolPath ? "patrolling" : "moving";
+      }
+    } else if (!u.patrolPath) next.state = "idle";
+    next.isFiring = false;
+    next.battery = Math.max(0, u.battery - CONFIG.TURRET_BATTERY_DRAIN * dt);
+    if (next.battery < CONFIG.TURRET_LOW_BATTERY) next.state = "charging";
     return next;
   }
 
@@ -198,9 +281,10 @@ export const tickUnit = (u, units, jamZones, dt) => {
       } while (u.type !== "ENEMY" && isOnLand(newGoal.x, newGoal.y) && attempts < 8);
       next.goal = newGoal;
     } else {
-      const speed = u.type === "ENEMY" ? CONFIG.ENEMY_SPEED :
-                    u.type === "SUBMARINE" ? CONFIG.SUBMARINE_SPEED :
-                    CONFIG.COMMERCIAL_SPEED;
+      const speed = u.speed ??
+                    (u.type === "ENEMY" ? CONFIG.ENEMY_SPEED :
+                     u.type === "SUBMARINE" ? CONFIG.SUBMARINE_SPEED :
+                     CONFIG.COMMERCIAL_SPEED);
       const v = norm({ x: dx, y: dy });
       const pos = moveIfWater(u, u.x + v.x * speed * dt, u.y + v.y * speed * dt);
       next.x = pos.x; next.y = pos.y;
@@ -241,7 +325,10 @@ export const updateDetections = (units, detections, dt) => {
         (f) => f.type === "USV" && f.state !== "charging" && dist(f, t) < CONFIG.SONAR_RANGE
       );
     } else {
-      const sensorRange = (f) => f.type === "UAV" ? CONFIG.UAV_SENSOR_RANGE : CONFIG.USV_SENSOR_RANGE;
+      const sensorRange = (f) =>
+        f.type === "UAV"    ? CONFIG.UAV_SENSOR_RANGE :
+        f.type === "TURRET" ? CONFIG.TURRET_SENSOR_RANGE :
+        CONFIG.USV_SENSOR_RANGE;
       inRange = friendlies.some(
         (f) => f.state !== "docked" && f.state !== "charging" &&
                f.state !== "jammed" && dist(f, t) < sensorRange(f)
@@ -309,6 +396,25 @@ export const generateAlerts = (units, detections, prevAlerts, jamEvents, simTime
                     : "UAV in GPS-denied envelope. RTB to USV.",
         unitId: je.unitId, time: simTime });
     }
+  });
+
+  // Turret engage-query: turret has target but weapons are NOT free (needs authorization)
+  units.forEach((u) => {
+    if (u.type !== "TURRET" || !u.engageTargetId || u.attackMode || u.attackSuppressed) return;
+    const hostile = units.find((x) => x.id === u.engageTargetId);
+    if (!hostile) return;
+    const eid = `turret-engage-query-${u.id}-${u.engageTargetId}`;
+    if (!has(eid))
+      alerts.unshift({ id: newId("alt"), eventId: eid,
+        kind: "ENGAGE.QUERY", severity: "high",
+        title: `${u.label} CONTACT — ${hostile.label}`,
+        body: "Weapons-free authorization required to engage.",
+        unitId: u.id, time: simTime,
+        actions: [
+          { label: "ENGAGE", action: { type: "TURRET_ATTACK_AUTHORIZE", turretId: u.id } },
+          { label: "SHADOW", action: { type: "TURRET_SUPPRESS_ATTACK",  turretId: u.id } },
+        ],
+      });
   });
 
   // Mission abort alerts

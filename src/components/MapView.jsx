@@ -208,7 +208,7 @@ export const MapView = ({
       const a = {
         ENEMY: "SPAWN_ENEMY", COMMERCIAL: "SPAWN_COMMERCIAL",
         SUBMARINE: "SPAWN_SUBMARINE", MINE: "SPAWN_MINE",
-        ISR: "SPAWN_ISR", JAM: "SPAWN_JAM_ZONE",
+        ISR: "SPAWN_ISR", JAM: "SPAWN_JAM_ZONE", TURRET: "SPAWN_TURRET",
       }[deployType];
       if (a) dispatch({ type: a, x: wp.x, y: wp.y });
       setTool("select");
@@ -286,6 +286,9 @@ export const MapView = ({
   const hasAirborneUAVSelected = state.units.some(
     (x) => state.selectedIds.includes(x.id) && x.type === "UAV" && x.state !== "docked"
   );
+  const hasTurretSelected = state.units.some(
+    (x) => state.selectedIds.includes(x.id) && x.type === "TURRET"
+  );
 
   const onClickUnit = (u, e) => {
     if (u.faction !== "friendly") {
@@ -311,14 +314,25 @@ export const MapView = ({
   const onUnitContextMenu = (u, e) => {
     if (state.selectedIds.length === 0) return;
     if (u.faction === "friendly") {
-      // Right-click any friendly not in selection → selected USVs/UAVs escort/follow it
-      if (!state.selectedIds.includes(u.id) && (hasUSVSelected || hasAirborneUAVSelected)) {
+      // Right-click a friendly not in selection → selected units escort/follow it
+      if (!state.selectedIds.includes(u.id) && (hasUSVSelected || hasAirborneUAVSelected || hasTurretSelected)) {
+        // Friendly fire check: only turrets selected (no ISR/UAV co-selected)
+        if (hasTurretSelected && !hasUSVSelected && !hasAirborneUAVSelected) {
+          dispatch({
+            type: "ADD_ALERT",
+            kind: "FRIENDLY.FIRE", severity: "high",
+            title: "FRIENDLY FIRE WARNING",
+            body: `Targeting ${u.label} with turret. Confirm engagement?`,
+            actions: [{ label: "CONFIRM", action: { type: "ENGAGE_TARGET", targetId: u.id } }],
+          });
+          return;
+        }
         dispatch({ type: "ENGAGE_TARGET", targetId: u.id });
       }
       return;
     }
-    // Right-click enemy/neutral → selected USVs engage; selected UAVs orbit (if detected)
-    if (!hasUSVSelected && !hasAirborneUAVSelected) return;
+    // Right-click enemy/neutral → selected USVs/turrets engage; selected UAVs orbit
+    if (!hasUSVSelected && !hasAirborneUAVSelected && !hasTurretSelected) return;
     const det = state.detections[u.id];
     if (!det || det.confidence < CONFIG.POSSIBLE_THRESHOLD) return;
     dispatch({ type: "ENGAGE_TARGET", targetId: u.id });
@@ -333,7 +347,9 @@ export const MapView = ({
     .filter((u) => u.faction === "friendly" && u.state !== "docked" && u.state !== "jammed")
     .map((u) => ({
       id: u.id, x: u.x, y: u.y,
-      r: u.type === "UAV" ? CONFIG.UAV_SENSOR_RANGE : CONFIG.USV_SENSOR_RANGE,
+      r: u.type === "UAV"    ? CONFIG.UAV_SENSOR_RANGE :
+         u.type === "TURRET" ? CONFIG.TURRET_SENSOR_RANGE :
+         CONFIG.USV_SENSOR_RANGE,
       sonar: u.type === "USV" ? CONFIG.SONAR_RANGE : 0,
     }));
 
@@ -650,7 +666,7 @@ export const MapView = ({
           isEscorted={u.faction === "friendly" && trackedFriendlyIds.has(u.id)}
           canTrack={
             !state.selectedIds.includes(u.id) &&
-            (hasUSVSelected || hasAirborneUAVSelected) &&
+            (hasUSVSelected || hasAirborneUAVSelected || hasTurretSelected) &&
             (u.faction === "friendly" ||
               (state.detections[u.id]?.confidence ?? 0) >= CONFIG.POSSIBLE_THRESHOLD)
           } />

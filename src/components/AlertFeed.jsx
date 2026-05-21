@@ -40,6 +40,7 @@ export const AlertFeed = ({ alerts, dispatch }) => (
       ) : alerts.map((a) => {
         const sevColor = a.severity === "high" ? COLORS.hostile :
                          a.severity === "med" ? COLORS.amber : COLORS.phosphor;
+        const hasActions = a.actions && a.actions.length > 0;
         return (
           <div key={a.id} style={{
             border: `1px solid ${sevColor}`, padding: "5px 7px",
@@ -63,9 +64,37 @@ export const AlertFeed = ({ alerts, dispatch }) => (
             <div style={{ fontSize: 9, color: COLORS.text, fontFamily: "'JetBrains Mono', monospace", marginTop: 2, lineHeight: 1.3 }}>
               {a.title}
             </div>
+            {a.body && (
+              <div style={{ fontSize: 7.5, color: COLORS.textDim, fontFamily: "'JetBrains Mono', monospace", marginTop: 2, lineHeight: 1.4 }}>
+                {a.body}
+              </div>
+            )}
             <div style={{ fontSize: 8, color: COLORS.textDim, fontFamily: "'JetBrains Mono', monospace", marginTop: 1 }}>
               T+{Math.floor(a.time)}s
             </div>
+            {hasActions && (
+              <div style={{ display: "flex", gap: 4, marginTop: 5 }}>
+                {a.actions.map((act, i) => {
+                  const isDestructive = act.label === "ENGAGE" || act.label === "CONFIRM";
+                  const btnColor = isDestructive ? COLORS.hostile : COLORS.phosphor;
+                  return (
+                    <button key={i} onClick={() => {
+                      if (act.action) dispatch(act.action);
+                      dispatch({ type: "DISMISS_ALERT", id: a.id });
+                    }} style={{
+                      flex: 1, padding: "3px 0", fontSize: 8, fontWeight: 700,
+                      fontFamily: "'JetBrains Mono', monospace",
+                      background: `${btnColor}15`,
+                      color: btnColor,
+                      border: `1px solid ${btnColor}`,
+                      cursor: "pointer", letterSpacing: "0.08em",
+                    }}>
+                      {act.label}
+                    </button>
+                  );
+                })}
+              </div>
+            )}
           </div>
         );
       })}

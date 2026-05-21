@@ -1,7 +1,7 @@
 import { CONFIG } from "../config";
 import { tickUnit, applyUAVRotation, updateDetections, generateAlerts } from "./tick";
 import { polygonSweepPath, placeVoronoiSeeds, voronoiSubPolygons } from "./geometry";
-import { newId, createEnemyVessel, createCommercialVessel, createSubmarine, createMine, createISRUnit, createJamZone } from "./factories";
+import { newId, createEnemyVessel, createCommercialVessel, createSubmarine, createMine, createISRUnit, createTurretUnit, createJamZone } from "./factories";
 import { isOnLand } from "./landData";
 
 // ─── Re-partition a patrol area for a (smaller) set of remaining unit IDs ──────
@@ -158,6 +158,60 @@ export const reducer = (state, action) => {
         });
       }
 
+      // ── Turret auto-follow new hostile contacts (weapons NOT free by default) ─
+      newHostileContacts.forEach((hostile) => {
+        if (isAlreadyTracked(hostile.id)) return;
+        const idleTurrets = units.filter((u) =>
+          u.type === "TURRET" && u.faction === "friendly" &&
+          (u.state === "idle" || u.state === "patrolling") && !u.engageTargetId
+        );
+        if (idleTurrets.length === 0) return;
+        const nearest = idleTurrets.reduce((a, b) =>
+          Math.hypot(a.x - hostile.x, a.y - hostile.y) <
+          Math.hypot(b.x - hostile.x, b.y - hostile.y) ? a : b
+        );
+        units = units.map((u) =>
+          u.id === nearest.id
+            ? { ...u, engageTargetId: hostile.id, state: "tracking",
+                attackMode: false, attackSuppressed: false, isFiring: false }
+            : u
+        );
+      });
+
+      // ── Damage from firing turrets ────────────────────────────────────────────
+      const damageMap = {};
+      units.forEach((trt) => {
+        if (trt.type !== "TURRET" || !trt.isFiring || !trt.engageTargetId) return;
+        const tgt = units.find((x) => x.id === trt.engageTargetId);
+        if (!tgt) return;
+        const d = Math.hypot(tgt.x - trt.x, tgt.y - trt.y);
+        if (d <= CONFIG.TURRET_FIRE_RANGE) {
+          damageMap[trt.engageTargetId] =
+            (damageMap[trt.engageTargetId] || 0) + CONFIG.TURRET_DAMAGE_PER_TICK * dt;
+        }
+      });
+      if (Object.keys(damageMap).length > 0) {
+        units = units.map((u) => {
+          const dmg = damageMap[u.id];
+          if (!dmg || u.health == null) return u;
+          return { ...u, health: Math.max(0, u.health - dmg) };
+        });
+      }
+
+      // ── Remove dead units (health exhausted) ─────────────────────────────────
+      const deadIds = new Set(
+        units.filter((u) => u.health != null && u.health <= 0).map((u) => u.id)
+      );
+      if (deadIds.size > 0) {
+        units = units.filter((u) => !deadIds.has(u.id));
+        // Clear dangling references on survivors
+        units = units.map((u) => ({
+          ...u,
+          engageTargetId: u.engageTargetId && deadIds.has(u.engageTargetId) ? null : u.engageTargetId,
+          trackTargetId:  u.trackTargetId  && deadIds.has(u.trackTargetId)  ? null : u.trackTargetId,
+        }));
+      }
+
       // ── #3/#4 Patrol interrupt: patrolling USV spots untracked contact ───────
       // Skip targets already being handled by another unit (don't double-assign)
       const patrolInterruptMap = {};
@@ -225,25 +279,44 @@ export const reducer = (state, action) => {
       const selectedFriendly = state.units.filter(
         (u) => state.selectedIds.includes(u.id) && u.faction === "friendly"
       );
-      const usvIds    = selectedFriendly.filter((u) => u.type === "USV").map((u) => u.id);
-      const soloUavIds = selectedFriendly.filter((u) => u.type === "UAV").map((u) => u.id);
+      const usvIds     = selectedFriendly.filter((u) => u.type === "USV").map((u) => u.id);
+      const trtIds     = selectedFriendly.filter((u) => u.type === "TURRET").map((u) => u.id);
+      // Only give direct orders to UAVs whose parent USV is NOT also in the selection.
+      // When the ISR group (USV + UAVs) is selected together, only the USV gets the move
+      // order — the UAVs follow naturally by orbiting their parent.
+      const soloUavIds = selectedFriendly.filter((u) =>
+        u.type === "UAV" &&
+        !state.selectedIds.includes(u.parentId)
+      ).map((u) => u.id);
+
+      let result = state;
 
       if (usvIds.length > 0) {
-        const cleared = clearOrdersForUSVs(state, usvIds);
+        const cleared = clearOrdersForUSVs(result, usvIds);
         const units = cleared.units.map((u) =>
           usvIds.includes(u.id) ? { ...u, goal: action.target, state: "moving" } : u
         );
-        return { ...state, units, patrolAreas: cleared.patrolAreas };
+        result = { ...result, units, patrolAreas: cleared.patrolAreas };
+      }
+      if (trtIds.length > 0) {
+        const cleared = clearOrdersForUSVs(result, trtIds);
+        const units = cleared.units.map((u) =>
+          trtIds.includes(u.id)
+            ? { ...u, goal: action.target, state: "moving",
+                engageTargetId: null, attackMode: false, isFiring: false }
+            : u
+        );
+        result = { ...result, units, patrolAreas: cleared.patrolAreas };
       }
       if (soloUavIds.length > 0) {
-        const units = state.units.map((u) =>
+        const units = result.units.map((u) =>
           soloUavIds.includes(u.id)
             ? { ...u, missionTarget: action.target, state: "flying_to_mission" }
             : u
         );
-        return { ...state, units };
+        result = { ...result, units };
       }
-      return state;
+      return result;
     }
 
     case "RECALL_UAV": {
@@ -261,12 +334,15 @@ export const reducer = (state, action) => {
       const usvIds = state.units
         .filter((u) => state.selectedIds.includes(u.id) && u.type === "USV")
         .map((u) => u.id);
+      const trtIds = state.units
+        .filter((u) => state.selectedIds.includes(u.id) && u.type === "TURRET")
+        .map((u) => u.id);
       // Airborne UAVs (not docked) can be assigned to orbit a target unit
       const uavIds = state.units
         .filter((u) => state.selectedIds.includes(u.id) && u.type === "UAV" && u.state !== "docked")
         .map((u) => u.id);
 
-      if (usvIds.length === 0 && uavIds.length === 0) return state;
+      if (usvIds.length === 0 && uavIds.length === 0 && trtIds.length === 0) return state;
 
       let result = state;
 
@@ -275,6 +351,17 @@ export const reducer = (state, action) => {
         const units = cleared.units.map((u) =>
           usvIds.includes(u.id)
             ? { ...u, engageTargetId: action.targetId, state: "tracking" }
+            : u
+        );
+        result = { ...result, units, patrolAreas: cleared.patrolAreas };
+      }
+
+      if (trtIds.length > 0) {
+        const cleared = clearOrdersForUSVs(result, trtIds);
+        const units = cleared.units.map((u) =>
+          trtIds.includes(u.id)
+            ? { ...u, engageTargetId: action.targetId, state: "tracking",
+                attackMode: false, attackSuppressed: false, isFiring: false }
             : u
         );
         result = { ...result, units, patrolAreas: cleared.patrolAreas };
@@ -293,19 +380,50 @@ export const reducer = (state, action) => {
       return result;
     }
 
+    case "TURRET_ATTACK_AUTHORIZE": {
+      const units = state.units.map((u) =>
+        u.id === action.turretId && u.type === "TURRET"
+          ? { ...u, attackMode: true, attackSuppressed: false }
+          : u
+      );
+      // Dismiss the matching engage-query alert
+      const alerts = state.alerts.filter(
+        (a) => !(a.kind === "ENGAGE.QUERY" && a.unitId === action.turretId)
+      );
+      return { ...state, units, alerts };
+    }
+
+    case "TURRET_SUPPRESS_ATTACK": {
+      const units = state.units.map((u) =>
+        u.id === action.turretId && u.type === "TURRET"
+          ? { ...u, attackMode: false, attackSuppressed: true, isFiring: false }
+          : u
+      );
+      const alerts = state.alerts.filter(
+        (a) => !(a.kind === "ENGAGE.QUERY" && a.unitId === action.turretId)
+      );
+      return { ...state, units, alerts };
+    }
+
     case "HOLD_SELECTED": {
       const usvIds = state.units
-        .filter((u) => state.selectedIds.includes(u.id) && u.type === "USV")
+        .filter((u) => state.selectedIds.includes(u.id) && (u.type === "USV" || u.type === "TURRET"))
         .map((u) => u.id);
       if (usvIds.length === 0) return state;
       const cleared = clearOrdersForUSVs(state, usvIds);
-      return { ...state, units: cleared.units, patrolAreas: cleared.patrolAreas };
+      // Also reset turret-specific fields
+      const units = cleared.units.map((u) =>
+        usvIds.includes(u.id) && u.type === "TURRET"
+          ? { ...u, attackMode: false, attackSuppressed: false, isFiring: false }
+          : u
+      );
+      return { ...state, units, patrolAreas: cleared.patrolAreas };
     }
 
     case "ADD_PATROL": {
       const { polygon, unitIds } = action;
       const usvIds = state.units
-        .filter((u) => unitIds.includes(u.id) && u.type === "USV")
+        .filter((u) => unitIds.includes(u.id) && (u.type === "USV" || u.type === "TURRET"))
         .map((u) => u.id);
       if (usvIds.length === 0) return state;
       const cleared = clearOrdersForUSVs(state, usvIds);
@@ -338,17 +456,21 @@ export const reducer = (state, action) => {
     }
 
     case "SPAWN_ENEMY":
-      return { ...state, units: [...state.units, createEnemyVessel(action.x, action.y)] };
+      return { ...state, units: [...state.units, createEnemyVessel(action.x, action.y, state.unitSettings?.ENEMY ?? {})] };
     case "SPAWN_COMMERCIAL":
-      return { ...state, units: [...state.units, createCommercialVessel(action.x, action.y)] };
+      return { ...state, units: [...state.units, createCommercialVessel(action.x, action.y, state.unitSettings?.COMMERCIAL ?? {})] };
     case "SPAWN_SUBMARINE":
-      return { ...state, units: [...state.units, createSubmarine(action.x, action.y)] };
+      return { ...state, units: [...state.units, createSubmarine(action.x, action.y, state.unitSettings?.SUBMARINE ?? {})] };
     case "SPAWN_MINE":
       if (isOnLand(action.x, action.y)) return state;
-      return { ...state, units: [...state.units, createMine(action.x, action.y)] };
+      return { ...state, units: [...state.units, createMine(action.x, action.y, state.unitSettings?.MINE ?? {})] };
     case "SPAWN_ISR": {
       const n = state.isrCount + 1;
-      return { ...state, isrCount: n, units: [...state.units, ...createISRUnit(action.x, action.y, n)] };
+      return { ...state, isrCount: n, units: [...state.units, ...createISRUnit(action.x, action.y, n, state.unitSettings?.USV ?? {})] };
+    }
+    case "SPAWN_TURRET": {
+      const n = (state.turretCount ?? 0) + 1;
+      return { ...state, turretCount: n, units: [...state.units, createTurretUnit(action.x, action.y, n, state.unitSettings?.TURRET ?? {})] };
     }
     case "SPAWN_JAM_ZONE":
       return { ...state, jamZones: [...state.jamZones, createJamZone(action.x, action.y)] };
@@ -382,8 +504,23 @@ export const reducer = (state, action) => {
           id: newId("alt"), eventId: `custom-${newId("ev")}`,
           kind: action.kind, severity: action.severity,
           title: action.title, body: action.body, time: state.simTime,
+          actions: action.actions ?? [],
         }, ...state.alerts].slice(0, 30),
       };
+
+    case "SET_UNIT_SETTINGS": {
+      const current = state.unitSettings ?? {};
+      return {
+        ...state,
+        unitSettings: {
+          ...current,
+          [action.unitType]: {
+            ...(current[action.unitType] ?? {}),
+            [action.key]: action.value,
+          },
+        },
+      };
+    }
 
     // ── #1 Mine marker removal — also deletes the mine unit ───────────────────
     case "REMOVE_MINE_MARKER": {
